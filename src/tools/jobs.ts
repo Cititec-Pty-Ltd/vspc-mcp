@@ -1,7 +1,7 @@
 import type { Api } from '../client.js';
 import type { FilterExpression } from '../types.js';
 import { VspcApiError, VspcAuthError, VspcRateLimitError } from '../types.js';
-import { LookupLog, Names, errorInfo, nameOrUid } from './lookups.js';
+import { LookupLog, Names, agentNames, errorInfo, nameOrUid } from './lookups.js';
 import type { ErrorInfo } from './lookups.js';
 import { oneLine, timeOf } from './shared.js';
 
@@ -144,8 +144,6 @@ export interface FailedJobsQuery {
   now?: number;
 }
 
-/** Most agent lookups per call (one GET each); past this, agent rows show the agent UID. */
-const MAX_AGENT_LOOKUPS = 40;
 
 function vb365Message(j: Record<string, unknown>): string | undefined {
   const logs = Array.isArray(j.lastErrorLogRecords) ? (j.lastErrorLogRecords as Record<string, unknown>[]) : [];
@@ -221,16 +219,15 @@ export async function findFailedJobs(api: Api, q: FailedJobsQuery): Promise<Fail
   // Names, best effort.
   const orgs = await log.safely('company names', names.organizations());
   const servers = jobs.some((j) => j.source === 'backup_server') ? await log.safely('backup server names', names.backupServers()) : undefined;
-  const agentUids = [...new Set(jobs.filter((j) => j.source === 'agent' && j.whereUid).map((j) => String(j.whereUid).toLowerCase()))].slice(
-    0,
-    MAX_AGENT_LOOKUPS
+  const agents = await agentNames(
+    names,
+    jobs.filter((j) => j.source === 'agent' && j.whereUid).map((j) => String(j.whereUid)),
+    log
   );
-  const agentNames = new Map<string, string | undefined>();
-  await Promise.all(agentUids.map(async (u) => agentNames.set(u, await names.agentName(u))));
   for (const j of jobs) {
     j.company = nameOrUid(orgs, j.companyUid);
     if (j.source === 'backup_server') j.where = nameOrUid(servers, j.whereUid);
-    else if (j.source === 'agent') j.where = nameOrUid(agentNames, j.whereUid);
+    else if (j.source === 'agent') j.where = nameOrUid(agents, j.whereUid);
     else j.where = j.where || nameOrUid(undefined, j.whereUid);
   }
 

@@ -3,7 +3,8 @@ import type { FilterExpression } from '../types.js';
 import { VspcApiError } from '../types.js';
 import { JOB_SOURCES, RESULT_STATUSES, companyFilter, findFailedJobs, groupFailures, jobBelongsTo, jobCompanyFilter, jobCompanyUid, statusFilter } from './jobs.js';
 import type { FailedJobsResult, JobSource } from './jobs.js';
-import { LookupLog, Names, nameOrUid, resolveCompany } from './lookups.js';
+import { LookupLog, Names, agentNames, errorInfo, nameOrUid, resolveCompany } from './lookups.js';
+import type { ErrorInfo } from './lookups.js';
 import type { ParamSpec, ReadSpec } from './spec.js';
 import { hoursAgo, oneLine, pick, timeOf } from './shared.js';
 
@@ -264,9 +265,7 @@ export const READ_SPECS: ReadSpec[] = [
       const names = new Names(api);
       const log = new LookupLog();
       const orgs = await log.safely('company names', names.organizations());
-      const agentUids = [...new Set(p.items.map((j) => String(j.backupAgentUid ?? '').toLowerCase()).filter(Boolean))].slice(0, 40);
-      const computers = new Map<string, string | undefined>();
-      await Promise.all(agentUids.map(async (u) => computers.set(u, await names.agentName(u))));
+      const computers = await agentNames(names, p.items.map((j) => String(j.backupAgentUid ?? '')), log);
       return {
         ...log.report(),
         ...paging(p),
@@ -396,6 +395,7 @@ export const READ_SPECS: ReadSpec[] = [
       // The time window goes to VSPC, so total, count and nextOffset are exact. If the console
       // refuses a date comparison (HTTP 400), filter here instead and say so (see the paging below).
       let timeFilter: 'vspc' | 'client' | undefined = since === undefined ? undefined : 'vspc';
+      let timeFilterFallback: ErrorInfo | undefined;
       let p;
       try {
         p = await query(
@@ -406,6 +406,7 @@ export const READ_SPECS: ReadSpec[] = [
       } catch (err) {
         if (!(since !== undefined && err instanceof VspcApiError && err.httpStatus === 400)) throw err;
         timeFilter = 'client';
+        timeFilterFallback = errorInfo(err);
         p = await query(filter);
       }
       const names = new Names(api);
@@ -451,6 +452,7 @@ export const READ_SPECS: ReadSpec[] = [
         offset: p.offset,
         ...(!reachedWindowEnd && nextRaw < p.total ? { nextOffset: nextRaw } : {}),
         timeFilter: 'client',
+        ...(timeFilterFallback ? { timeFilterFallback } : {}),
         note: reachedWindowEnd
           ? 'Time filter applied after fetching; this page reached alarms older than the window, so there are no more in it.'
           : 'Time filter applied after fetching; a page can show fewer alarms than limit. Follow nextOffset for more.',

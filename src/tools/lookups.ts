@@ -57,15 +57,16 @@ export class Names {
     );
   }
 
-  /** Computer name of a Veeam backup agent (one GET per agent, remembered for this call). */
+  /**
+   * Computer name of a Veeam backup agent (one GET per agent, remembered for
+   * this call). It rejects when the GET fails: callers go through
+   * agentNames(), which records the failure in the LookupLog.
+   */
   agentName(uid: string): Promise<string | undefined> {
     const key = uid.toLowerCase();
     let p = this.agents.get(key);
     if (!p) {
-      p = this.api
-        .get<{ name?: string }>(`/infrastructure/backupAgents/${key}`)
-        .then((a) => (a?.name ? String(a.name) : undefined))
-        .catch(() => undefined);
+      p = this.api.get<{ name?: string }>(`/infrastructure/backupAgents/${key}`).then((a) => (a?.name ? String(a.name) : undefined));
       this.agents.set(key, p);
     }
     return p;
@@ -114,15 +115,36 @@ export function errorInfo(err: unknown): ErrorInfo {
  * instead of names, or without session counts), but the reason is kept and
  * returned as lookupErrors, so a 403 is not mistaken for a passing glitch.
  */
+export type LookupError = { lookup: string } & ErrorInfo & { count?: number };
+
+const UID_IN_TEXT = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+
 export class LookupLog {
-  private readonly errors: ({ lookup: string } & ErrorInfo)[] = [];
+  private readonly errors: LookupError[] = [];
 
   async safely<T>(lookup: string, p: Promise<T>): Promise<T | undefined> {
     try {
       return await p;
     } catch (err) {
-      this.errors.push({ lookup, ...errorInfo(err) });
+      this.record(lookup, err);
       return undefined;
+    }
+  }
+
+  /**
+   * Records a failed lookup. The same failure again (e.g. 30 agent-name GETs
+   * all refused with 403) adds to `count` instead of a new entry.
+   */
+  record(lookup: string, err: unknown): void {
+    const info = errorInfo(err);
+    // Per-item requests (one GET per agent) differ only in the UID in the path.
+    const shape = (s: string) => s.replace(UID_IN_TEXT, '{uid}');
+    const same = this.errors.find((e) => e.lookup === lookup && shape(e.error) === shape(info.error) && e.httpStatus === info.httpStatus);
+    if (same) {
+      same.count = (same.count ?? 1) + 1;
+      same.error = shape(same.error);
+    } else {
+      this.errors.push({ lookup, ...info });
     }
   }
 
@@ -130,14 +152,37 @@ export class LookupLog {
   errorFor(lookup: string): ErrorInfo | undefined {
     const e = this.errors.find((x) => x.lookup === lookup);
     if (!e) return undefined;
-    const { lookup: _l, ...info } = e;
+    const { lookup: _l, count: _c, ...info } = e;
     return info;
   }
 
   /** `{ lookupErrors }` when any lookup failed; spread into a tool's output. */
-  report(): { lookupErrors?: ({ lookup: string } & ErrorInfo)[] } {
-    return this.errors.length ? { lookupErrors: [...this.errors] } : {};
+  report(): { lookupErrors?: LookupError[] } {
+    return this.errors.length ? { lookupErrors: this.errors.map((e) => ({ ...e })) } : {};
   }
+}
+
+/** Most agent-name lookups per tool call (one GET each); agents past it show their UID, and the log says so. */
+export const MAX_AGENT_LOOKUPS = 40;
+
+/**
+ * Computer names for these agent UIDs (lower-cased keys), at most
+ * MAX_AGENT_LOOKUPS of them. Every agent that is not named, because its GET
+ * failed or because of the cap, is reported in the log.
+ */
+export async function agentNames(names: Names, uids: string[], log: LookupLog): Promise<Map<string, string | undefined>> {
+  const unique = [...new Set(uids.map((u) => u.toLowerCase()).filter(Boolean))];
+  const looked = unique.slice(0, MAX_AGENT_LOOKUPS);
+  const out = new Map<string, string | undefined>();
+  await Promise.all(looked.map(async (u) => out.set(u, await log.safely('agent names', names.agentName(u)))));
+  const skipped = unique.length - looked.length;
+  if (skipped > 0) {
+    log.record(
+      'agent names',
+      new Error(`${skipped} of ${unique.length} agents were not looked up (at most ${MAX_AGENT_LOOKUPS} per call); they show their UID`)
+    );
+  }
+  return out;
 }
 
 /** Most company-name matches read when resolving a name. */

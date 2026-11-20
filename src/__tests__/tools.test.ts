@@ -3,7 +3,7 @@ import { ALL_SPECS, ALL_TOOLS, READ_TOOL_NAMES, WRITE_TOOL_NAMES, dispatchToolCa
 import { SERVER_INSTRUCTIONS } from '../server.js';
 import { parseVspcUrl, runWithConfig, setFetchForTests, scrub, buildUrl, getConfig, canonicalJson, writeRequestId } from '../client.js';
 import { baseJobName, groupFailures } from '../tools/jobs.js';
-import { MAX_NAME_MATCHES, NAME_CACHE_TTL_MS, clearNameCacheForTests, nameOrUid } from '../tools/lookups.js';
+import { MAX_AGENT_LOOKUPS, MAX_NAME_MATCHES, NAME_CACHE_TTL_MS, clearNameCacheForTests, nameOrUid } from '../tools/lookups.js';
 import type { FailedJob } from '../tools/jobs.js';
 import { fakeVspc, filterOf, json, page, textOf } from './test-helpers.js';
 
@@ -346,6 +346,8 @@ describe('paging and lists', () => {
       setFetchForTests(vspc.fn);
       const out = JSON.parse(textOf(await call('vspc_list_alarms', { hours: 24, limit: 2 })));
       expect(out).toMatchObject({ totalUnfiltered: 7, count: 1, pageCountUnfiltered: 2, offset: 0, timeFilter: 'client' });
+      // ... and why VSPC's own time filter was not used
+      expect(out.timeFilterFallback).toMatchObject({ httpStatus: 400, error: expect.stringContaining('Unsupported filter') });
       // newest first: the page reached an alarm outside the window, so nothing later can be in it
       expect(out.nextOffset).toBeUndefined();
       expect(out.alarms.map((a: { instanceUid: string }) => a.instanceUid)).toEqual([AL1]);
@@ -747,6 +749,65 @@ describe('a job\'s company', () => {
     expect(JSON.parse(textOf(await call('vspc_list_jobs', { company: C2 }))).jobs.map((j: { name: string }) => j.name)).toEqual(['Hosted nightly']);
     expect(JSON.parse(textOf(await call('vspc_list_failed_jobs', { company: C2 }))).count).toBe(1);
     expect(JSON.parse(textOf(await call('vspc_list_jobs', { company: C1 }))).total).toBe(0);
+  });
+});
+
+describe('agent names', () => {
+  const now = Date.now();
+  const agentJob = (i: number) => ({
+    instanceUid: `aj${i}`,
+    name: 'Workstations',
+    backupAgentUid: `bbbbbbbb-bbbb-4bbb-8bbb-${String(i).padStart(12, '0')}`,
+    organizationUid: C1,
+    status: 'Failed',
+    lastEndTime: new Date(now - 3_600_000).toISOString(),
+  });
+  const refused = () => json({ data: null, errors: [{ message: 'Access denied' }] }, 403);
+
+  it('reports refused agent-name lookups once, with a count, and shows the UIDs', async () => {
+    const jobs = [agentJob(1), agentJob(2)];
+    const routes: Record<string, unknown> = {
+      '/infrastructure/backupAgents/jobs': page(jobs),
+      '/infrastructure/backupServers/jobs': page([]),
+      '/infrastructure/vb365Servers/organizations/jobs': page([]),
+      '/organizations': ORGS,
+    };
+    for (const j of jobs) routes[`/infrastructure/backupAgents/${j.backupAgentUid}`] = refused;
+    setFetchForTests(fakeVspc(routes as never).fn);
+    const listed = JSON.parse(textOf(await call('vspc_list_agent_jobs')));
+    expect(listed.agentJobs.map((j: { computer: string }) => j.computer)).toEqual(jobs.map((j) => j.backupAgentUid));
+    expect(listed.lookupErrors).toEqual([{ lookup: 'agent names', httpStatus: 403, count: 2, error: expect.stringContaining('Access denied') }]);
+    expect(listed.lookupErrors[0].error).toContain('GET /infrastructure/backupAgents/{uid}');
+    const failed = JSON.parse(textOf(await call('vspc_list_failed_jobs')));
+    expect(failed.lookupErrors).toEqual([{ lookup: 'agent names', httpStatus: 403, count: 2, error: expect.stringContaining('(HTTP 403)') }]);
+  });
+
+  it('says when agents were not looked up because of the cap', async () => {
+    const jobs = Array.from({ length: MAX_AGENT_LOOKUPS + 5 }, (_, i) => agentJob(i));
+    const vspc = fakeVspc({
+      '/infrastructure/backupAgents/jobs': page(jobs),
+      '/organizations': ORGS,
+      ...Object.fromEntries(jobs.map((j) => [`/infrastructure/backupAgents/${j.backupAgentUid}`, json({ data: { name: `PC-${j.instanceUid}` } })])),
+    });
+    setFetchForTests(vspc.fn);
+    const out = JSON.parse(textOf(await call('vspc_list_agent_jobs', { limit: 100 })));
+    expect(vspc.calls.filter((c) => c.path.startsWith('/infrastructure/backupAgents/b'))).toHaveLength(MAX_AGENT_LOOKUPS);
+    expect(out.lookupErrors).toEqual([{ lookup: 'agent names', error: `5 of ${MAX_AGENT_LOOKUPS + 5} agents were not looked up (at most ${MAX_AGENT_LOOKUPS} per call); they show their UID` }]);
+    expect(out.agentJobs.filter((j: { computer: string }) => j.computer.startsWith('PC-'))).toHaveLength(MAX_AGENT_LOOKUPS);
+  });
+
+  it('reports nothing when every agent is named', async () => {
+    const jobs = [agentJob(1)];
+    setFetchForTests(
+      fakeVspc({
+        '/infrastructure/backupAgents/jobs': page(jobs),
+        '/organizations': ORGS,
+        [`/infrastructure/backupAgents/${jobs[0].backupAgentUid}`]: json({ data: { name: 'PC-1' } }),
+      }).fn
+    );
+    const out = JSON.parse(textOf(await call('vspc_list_agent_jobs')));
+    expect(out.agentJobs[0].computer).toBe('PC-1');
+    expect(out.lookupErrors).toBeUndefined();
   });
 });
 
