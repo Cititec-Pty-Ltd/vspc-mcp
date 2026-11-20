@@ -54,6 +54,7 @@ A failure count is never shown as a clean zero when data is missing:
 - If no source can be read (for example, the console is unreachable), the tool returns an error giving each source's reason. A rate-limit wait is kept, as `rate_limited`.
 - If some sources fail, or one is cut short at its cap, the result starts with `complete: false` and a `warning`: the counts are a lower bound, and zero does not mean no failures. The result lists `sourceErrors` and `partialSources`.
 - If VSPC's session counts cannot be read, the summary returns `sessionCounts: null` and gives the reason.
+- A name lookup or count that failed is listed in `lookupErrors`, so a refused request (403) is not mistaken for a passing glitch. It gives what was being looked up, the error text (method and path only, never the key or query string), the HTTP status, and for a 429 `rateLimited` and `retryAfterSeconds`. Rows still show UIDs where the names are missing. `sourceErrors` use the same form.
 
 ### Write tools
 

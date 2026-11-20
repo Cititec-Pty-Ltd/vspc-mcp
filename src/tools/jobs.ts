@@ -1,7 +1,8 @@
 import type { Api } from '../client.js';
 import type { FilterExpression } from '../types.js';
 import { VspcApiError, VspcAuthError, VspcRateLimitError } from '../types.js';
-import { Names, nameOrUid, safely } from './lookups.js';
+import { LookupLog, Names, errorInfo, nameOrUid } from './lookups.js';
+import type { ErrorInfo } from './lookups.js';
 import { oneLine, timeOf } from './shared.js';
 
 /**
@@ -113,9 +114,11 @@ export interface FailedJobsResult {
    */
   complete: boolean;
   /** Sources that could not be read, and why. */
-  sourceErrors: { source: JobSource; error: string }[];
+  sourceErrors: ({ source: JobSource } & ErrorInfo)[];
   /** Sources read only in part (the page or time cap was hit). */
   partialSources: JobSource[];
+  /** Name lookups that failed (rows then show UIDs), with the reason. */
+  lookupErrors: ReturnType<LookupLog['report']>['lookupErrors'];
 }
 
 /**
@@ -155,6 +158,7 @@ export async function findFailedJobs(api: Api, q: FailedJobsQuery): Promise<Fail
   const since = now - q.hours * 3_600_000;
   const deadline = now + 40_000;
   const names = new Names(api);
+  const log = new LookupLog();
   const scanned: FailedJobsResult['scanned'] = {};
   const failures: { source: JobSource; err: unknown }[] = [];
   const jobs: FailedJob[] = [];
@@ -215,8 +219,8 @@ export async function findFailedJobs(api: Api, q: FailedJobsQuery): Promise<Fail
   if (failures.length === sources.length) throw allSourcesFailed(failures);
 
   // Names, best effort.
-  const orgs = await safely(names.organizations());
-  const servers = jobs.some((j) => j.source === 'backup_server') ? await safely(names.backupServers()) : undefined;
+  const orgs = await log.safely('company names', names.organizations());
+  const servers = jobs.some((j) => j.source === 'backup_server') ? await log.safely('backup server names', names.backupServers()) : undefined;
   const agentUids = [...new Set(jobs.filter((j) => j.source === 'agent' && j.whereUid).map((j) => String(j.whereUid).toLowerCase()))].slice(
     0,
     MAX_AGENT_LOOKUPS
@@ -237,8 +241,9 @@ export async function findFailedJobs(api: Api, q: FailedJobsQuery): Promise<Fail
     jobs,
     scanned,
     complete: sources.every((s) => scanned[s]?.complete === true),
-    sourceErrors: failures.map((f) => ({ source: f.source, error: (f.err as Error).message })),
+    sourceErrors: failures.map((f) => ({ source: f.source, ...errorInfo(f.err) })),
     partialSources: sources.filter((s) => scanned[s] && !scanned[s].error && !scanned[s].complete),
+    lookupErrors: log.report().lookupErrors,
   };
 }
 

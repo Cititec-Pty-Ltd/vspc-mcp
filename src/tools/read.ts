@@ -3,7 +3,7 @@ import type { FilterExpression } from '../types.js';
 import { VspcApiError } from '../types.js';
 import { JOB_SOURCES, RESULT_STATUSES, companyFilter, findFailedJobs, groupFailures, jobBelongsTo, jobCompanyFilter, jobCompanyUid, statusFilter } from './jobs.js';
 import type { FailedJobsResult, JobSource } from './jobs.js';
-import { Names, nameOrUid, resolveCompany, safely } from './lookups.js';
+import { LookupLog, Names, nameOrUid, resolveCompany } from './lookups.js';
 import type { ParamSpec, ReadSpec } from './spec.js';
 import { hoursAgo, oneLine, pick, timeOf } from './shared.js';
 
@@ -72,6 +72,12 @@ function coverage(r: FailedJobsResult): Record<string, unknown> {
   };
 }
 
+/** The failure path's lookup errors, plus any of this tool's own. */
+function lookupErrorsOf(r: FailedJobsResult, log?: LookupLog): Record<string, unknown> {
+  const all = [...(r.lookupErrors ?? []), ...(log?.report().lookupErrors ?? [])];
+  return all.length ? { lookupErrors: all } : {};
+}
+
 /** Rows in vspc_failed_jobs_summary (Failed rows sort first; byCompany always counts every row). */
 const MAX_SUMMARY_ROWS = 120;
 
@@ -110,8 +116,10 @@ export const READ_SPECS: ReadSpec[] = [
         limit: args.limit as number,
         offset: args.offset as number,
       });
-      const resellers = await safely(new Names(api).organizations());
+      const log = new LookupLog();
+      const resellers = await log.safely('reseller names', new Names(api).organizations());
       return {
+        ...log.report(),
         ...paging(p),
         companies: p.items.map((c) => ({
           ...pick(c, ['instanceUid', 'name', 'status']),
@@ -156,8 +164,10 @@ export const READ_SPECS: ReadSpec[] = [
         offset: args.offset as number,
       });
       const names = new Names(api);
-      const orgs = await safely(names.organizations());
+      const log = new LookupLog();
+      const orgs = await log.safely('company names', names.organizations());
       return {
+        ...log.report(),
         ...paging(p),
         backupServers: p.items.map((s) => ({
           ...pick(s, ['instanceUid', 'name']),
@@ -206,8 +216,10 @@ export const READ_SPECS: ReadSpec[] = [
         p = await api.page(path, { filter, sort, limit, offset });
       }
       const names = new Names(api);
-      const [orgs, servers] = await Promise.all([safely(names.organizations()), safely(names.backupServers())]);
+      const log = new LookupLog();
+      const [orgs, servers] = await Promise.all([log.safely('company names', names.organizations()), log.safely('backup server names', names.backupServers())]);
       return {
+        ...log.report(),
         ...paging(p),
         ...(complete
           ? {}
@@ -250,11 +262,13 @@ export const READ_SPECS: ReadSpec[] = [
         offset: args.offset as number,
       });
       const names = new Names(api);
-      const orgs = await safely(names.organizations());
+      const log = new LookupLog();
+      const orgs = await log.safely('company names', names.organizations());
       const agentUids = [...new Set(p.items.map((j) => String(j.backupAgentUid ?? '').toLowerCase()).filter(Boolean))].slice(0, 40);
       const computers = new Map<string, string | undefined>();
       await Promise.all(agentUids.map(async (u) => computers.set(u, await names.agentName(u))));
       return {
+        ...log.report(),
         ...paging(p),
         agentJobs: p.items.map((j) => ({
           ...pick(j, ['instanceUid', 'name']),
@@ -295,6 +309,7 @@ export const READ_SPECS: ReadSpec[] = [
         ...coverage(r),
         window: r.window,
         statuses: r.statuses,
+        ...lookupErrorsOf(r),
         count: r.jobs.length,
         ...(r.jobs.length > (args.max_rows as number) ? { shown: args.max_rows, more: 'Narrow by company, sources or hours, or use vspc_failed_jobs_summary.' } : {}),
         jobs: r.jobs.slice(0, args.max_rows as number),
@@ -318,11 +333,12 @@ export const READ_SPECS: ReadSpec[] = [
       const now = Date.now();
       const hours = args.hours as number;
       const statuses = args.include_warnings ? ['Failed', 'Warning'] : ['Failed'];
+      const log = new LookupLog();
       const [r, heat] = await Promise.all([
         findFailedJobs(api, { hours, statuses, sources: [...JOB_SOURCES], companyUid: company?.uid, now }),
         company
           ? Promise.resolve(undefined)
-          : safely(api.get<Record<string, unknown>>('/infrastructure/jobSessionHeatmap/', { from: hoursAgo(hours, now), to: new Date(now).toISOString() })),
+          : log.safely('session counts', api.get<Record<string, unknown>>('/infrastructure/jobSessionHeatmap/', { from: hoursAgo(hours, now), to: new Date(now).toISOString() })),
       ]);
       const groups = groupFailures(r.jobs);
       const perCompany = new Map<string, { failed: number; warning: number }>();
@@ -340,7 +356,8 @@ export const READ_SPECS: ReadSpec[] = [
           ? { sessionCounts: pick(heat, ['successJobsCount', 'warningJobsCount', 'failJobsCount']) }
           : company
             ? {}
-            : { sessionCounts: null, sessionCountsError: 'VSPC\'s session counts could not be read for this window.' }),
+            : { sessionCounts: null, sessionCountsError: log.errorFor('session counts') ?? { error: 'VSPC returned no session counts for this window.' } }),
+        ...lookupErrorsOf(r, log),
         failingJobs: groups.length,
         byCompany: [...perCompany.entries()]
           .map(([name, c]) => ({ company: name, ...c }))
@@ -392,9 +409,10 @@ export const READ_SPECS: ReadSpec[] = [
         p = await query(filter);
       }
       const names = new Names(api);
+      const log = new LookupLog();
       const [orgs, templates] = await Promise.all([
-        safely(names.organizations()),
-        safely(api.all<Record<string, unknown>>('/alarms/templates', {}, { maxItems: 5_000 })),
+        log.safely('company names', names.organizations()),
+        log.safely('alarm names', api.all<Record<string, unknown>>('/alarms/templates', {}, { maxItems: 5_000 })),
       ]);
       const templateName = new Map((templates?.items ?? []).map((t) => [String(t.instanceUid ?? '').toLowerCase(), String(t.name ?? '')]));
       const inWindow = (a: Record<string, unknown>) =>
@@ -418,7 +436,7 @@ export const READ_SPECS: ReadSpec[] = [
           };
         });
       if (timeFilter !== 'client' && alarms.length === p.items.length) {
-        return { ...paging(p), ...(timeFilter ? { timeFilter } : {}), alarms };
+        return { ...log.report(), ...paging(p), ...(timeFilter ? { timeFilter } : {}), alarms };
       }
       // Filtered here: `count` is what this page shows, `pageCountUnfiltered` what VSPC returned.
       // Alarms come newest first, so once this page reaches one outside the window there is
@@ -426,6 +444,7 @@ export const READ_SPECS: ReadSpec[] = [
       const nextRaw = p.offset + p.count;
       const reachedWindowEnd = p.items.some((a) => !inWindow(a));
       return {
+        ...log.report(),
         totalUnfiltered: p.total,
         count: alarms.length,
         pageCountUnfiltered: p.count,
@@ -462,8 +481,10 @@ export const READ_SPECS: ReadSpec[] = [
         offset: args.offset as number,
       });
       const names = new Names(api);
-      const [orgs, servers] = await Promise.all([safely(names.organizations()), safely(names.backupServers())]);
+      const log = new LookupLog();
+      const [orgs, servers] = await Promise.all([log.safely('company names', names.organizations()), log.safely('backup server names', names.backupServers())]);
       return {
+        ...log.report(),
         ...paging(p),
         vms: p.items.map((v) => ({
           ...pick(v, ['instanceUid', 'name']),
@@ -516,7 +537,8 @@ export const READ_SPECS: ReadSpec[] = [
         offset: args.offset as number,
       });
       const names = new Names(api);
-      const [orgs, servers] = await Promise.all([safely(names.organizations()), safely(names.backupServers())]);
+      const log = new LookupLog();
+      const [orgs, servers] = await Promise.all([log.safely('company names', names.organizations()), log.safely('backup server names', names.backupServers())]);
       // Every unit and count field of CurrentLicenseUsageWorkload (and ...ByPlatform) in the 3.6.1 spec.
       const nonZero = (w: Record<string, unknown>) => USAGE_FIELDS.some((f) => Number(w[f] ?? 0) !== 0);
       const totals = new Map<string, { workload: string; unitType?: unknown } & Record<UsageField, number>>();
@@ -547,6 +569,7 @@ export const READ_SPECS: ReadSpec[] = [
         })),
       }));
       return {
+        ...log.report(),
         ...paging(p),
         totals: [...totals.values()],
         organizations,

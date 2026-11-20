@@ -1,5 +1,6 @@
 import type { Api } from '../client.js';
-import { InputError, isUuid } from './shared.js';
+import { VspcRateLimitError } from '../types.js';
+import { InputError, isUuid, oneLine } from './shared.js';
 
 /** How long the organisation and backup server name lists are reused. */
 export const NAME_CACHE_TTL_MS = 5 * 60_000;
@@ -81,12 +82,61 @@ export class Names {
   }
 }
 
-/** Lookups are a convenience: if one fails, results still come back with UIDs only. */
-export async function safely<T>(p: Promise<T>): Promise<T | undefined> {
-  try {
-    return await p;
-  } catch {
-    return undefined;
+/**
+ * A failure, safe to return: the message (request errors are written by the
+ * client with the method and path only, never the key or the query string,
+ * and any bearer token is masked again here), the HTTP status, and for a 429
+ * the wait. Used for sourceErrors, lookupErrors and sessionCountsError.
+ */
+export interface ErrorInfo {
+  error: string;
+  httpStatus?: number;
+  rateLimited?: true;
+  retryAfterSeconds?: number;
+}
+
+export function errorInfo(err: unknown): ErrorInfo {
+  const raw = err instanceof Error ? err.message : String(err);
+  const out: ErrorInfo = {
+    error: oneLine(raw.replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/g, 'Bearer [REDACTED]'), 400) ?? 'unknown error',
+  };
+  const status = (err as { httpStatus?: unknown })?.httpStatus;
+  if (typeof status === 'number') out.httpStatus = status;
+  if (err instanceof VspcRateLimitError) {
+    out.rateLimited = true;
+    out.retryAfterSeconds = err.retryAfterSeconds;
+  }
+  return out;
+}
+
+/**
+ * Lookups are a convenience: if one fails, results still come back (with UIDs
+ * instead of names, or without session counts), but the reason is kept and
+ * returned as lookupErrors, so a 403 is not mistaken for a passing glitch.
+ */
+export class LookupLog {
+  private readonly errors: ({ lookup: string } & ErrorInfo)[] = [];
+
+  async safely<T>(lookup: string, p: Promise<T>): Promise<T | undefined> {
+    try {
+      return await p;
+    } catch (err) {
+      this.errors.push({ lookup, ...errorInfo(err) });
+      return undefined;
+    }
+  }
+
+  /** The error for one lookup, if it failed. */
+  errorFor(lookup: string): ErrorInfo | undefined {
+    const e = this.errors.find((x) => x.lookup === lookup);
+    if (!e) return undefined;
+    const { lookup: _l, ...info } = e;
+    return info;
+  }
+
+  /** `{ lookupErrors }` when any lookup failed; spread into a tool's output. */
+  report(): { lookupErrors?: ({ lookup: string } & ErrorInfo)[] } {
+    return this.errors.length ? { lookupErrors: [...this.errors] } : {};
   }
 }
 
