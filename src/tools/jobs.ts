@@ -58,9 +58,19 @@ export function jobCompanyUid(source: JobSource, job: Record<string, unknown>): 
   return undefined;
 }
 
-/** VSPC filter for a company's jobs: any of the source's company fields (so a job matches by either). */
+/**
+ * VSPC pre-filter for a company's jobs: any of the source's company fields.
+ * It is a superset (a hosted job also matches its server's owner), so callers
+ * must keep only jobs for which jobBelongsTo is true: a job belongs to the
+ * company jobCompanyUid shows, and to no other.
+ */
 export function jobCompanyFilter(source: JobSource, uid: string): FilterExpression {
   return companyFilter(SOURCES[source].companyProperties, uid);
+}
+
+/** True if the job's effective company (jobCompanyUid) is `uid`. */
+export function jobBelongsTo(source: JobSource, job: Record<string, unknown>, uid: string): boolean {
+  return jobCompanyUid(source, job) === uid.trim().toLowerCase();
 }
 
 export function statusFilter(property: string, statuses: readonly string[]): FilterExpression {
@@ -146,6 +156,8 @@ export async function findFailedJobs(api: Api, q: FailedJobsQuery): Promise<Fail
       for (const j of got.items) {
         const ended = timeOf(j.lastEndTime) ?? timeOf(j.lastRun);
         if (ended === undefined || ended < since) continue;
+        // VSPC's company filter is a superset (see jobCompanyFilter): keep only the company's own jobs.
+        if (q.companyUid && !jobBelongsTo(source, j, q.companyUid)) continue;
         const status = String((source === 'vb365' ? j.lastStatus : j.status) ?? 'Unknown');
         const companyUid = jobCompanyUid(source, j);
         jobs.push({

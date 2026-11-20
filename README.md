@@ -24,7 +24,7 @@ It uses the same framework as Cititec's other MCP servers: TypeScript, `@modelco
 
 ## Tools
 
-Read tools only send GET requests. Results are trimmed to the useful fields. Company and server UIDs are turned into names, and each response is capped at 60,000 characters. `company` accepts a company's UID or its name (an exact or unique partial match). Secrets in VSPC responses, such as a company's owner credentials, are never returned.
+Read tools only send GET requests. Results are trimmed to the useful fields. Company and server UIDs are turned into names, and each response is capped at 60,000 characters. `company` accepts a company's UID or its name (an exact or unique partial match). A job belongs to one company: the company it is assigned to (`mappedOrganizationUid`), or the backup server's owner (`organizationUid`) when it is not assigned. A job on a hosted server shows under, and is filtered by, that one company. It is not listed for the provider that owns the server. Secrets in VSPC responses, such as a company's owner credentials, are never returned.
 
 | Tool | VSPC endpoint(s) |
 |------|------------------|

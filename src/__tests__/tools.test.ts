@@ -573,11 +573,52 @@ describe('a job\'s company', () => {
     expect(summary.byCompany).toEqual([{ company: 'Client One', failed: 1, warning: 0 }]);
   });
 
+  // A second job on the same hosted server that really is the provider's own.
+  const providerJob = { ...hostedJob, instanceUid: 'p1', name: 'Provider config backup', mappedOrganizationUid: null };
+
+  it('asking for the provider leaves out jobs mapped to a client, everywhere', async () => {
+    const vspc = fakeVspc({ ...routes, '/infrastructure/backupServers/jobs': page([hostedJob, providerJob]) });
+    setFetchForTests(vspc.fn);
+    const list = JSON.parse(textOf(await call('vspc_list_jobs', { company: C2 })));
+    expect(list.jobs.map((j: { name: string }) => j.name)).toEqual(['Provider config backup']);
+    expect(list).toMatchObject({ total: 1, count: 1, offset: 0 });
+    expect(list.nextOffset).toBeUndefined();
+    const failed = JSON.parse(textOf(await call('vspc_list_failed_jobs', { company: C2 })));
+    expect(failed.jobs.map((j: { job: string }) => j.job)).toEqual(['Provider config backup']);
+    const summary = JSON.parse(textOf(await call('vspc_failed_jobs_summary', { company: C2 })));
+    expect(summary.rows.map((r: { job: string }) => r.job)).toEqual(['Provider config backup']);
+    expect(summary.byCompany).toEqual([{ company: 'Client Two', failed: 1, warning: 0 }]);
+  });
+
+  it('asking for the client includes its hosted job', async () => {
+    setFetchForTests(fakeVspc({ ...routes, '/infrastructure/backupServers/jobs': page([hostedJob, providerJob]) }).fn);
+    const list = JSON.parse(textOf(await call('vspc_list_jobs', { company: C1 })));
+    expect(list.jobs.map((j: { name: string }) => j.name)).toEqual(['Hosted nightly']);
+    expect(list.total).toBe(1);
+    const failed = JSON.parse(textOf(await call('vspc_list_failed_jobs', { company: C1 })));
+    expect(failed.jobs.map((j: { job: string }) => j.job)).toEqual(['Hosted nightly']);
+  });
+
+  it('pages a company\'s jobs exactly after the company check', async () => {
+    const jobs = [hostedJob, providerJob, { ...providerJob, instanceUid: 'p2', name: 'Provider 2' }, { ...providerJob, instanceUid: 'p3', name: 'Provider 3' }];
+    setFetchForTests(fakeVspc({ ...routes, '/infrastructure/backupServers/jobs': page(jobs) }).fn);
+    const first = JSON.parse(textOf(await call('vspc_list_jobs', { company: C2, limit: 2 })));
+    expect(first).toMatchObject({ total: 3, count: 2, offset: 0, nextOffset: 2 });
+    const second = JSON.parse(textOf(await call('vspc_list_jobs', { company: C2, limit: 2, offset: 2 })));
+    expect(second).toMatchObject({ total: 3, count: 1, offset: 2 });
+    expect(second.nextOffset).toBeUndefined();
+    expect([...first.jobs, ...second.jobs].map((j: { name: string }) => j.name)).not.toContain('Hosted nightly');
+  });
+
   it('falls back to the server owner when the mapped company is empty', async () => {
     const unmapped = { ...hostedJob, mappedOrganizationUid: '' };
     setFetchForTests(fakeVspc({ ...routes, '/infrastructure/backupServers/jobs': page([unmapped]) }).fn);
     expect(JSON.parse(textOf(await call('vspc_list_jobs'))).jobs[0].company).toBe('Client Two');
     expect(JSON.parse(textOf(await call('vspc_list_failed_jobs'))).jobs[0].company).toBe('Client Two');
+    // ... and matches when the owner is asked for
+    expect(JSON.parse(textOf(await call('vspc_list_jobs', { company: C2 }))).jobs.map((j: { name: string }) => j.name)).toEqual(['Hosted nightly']);
+    expect(JSON.parse(textOf(await call('vspc_list_failed_jobs', { company: C2 }))).count).toBe(1);
+    expect(JSON.parse(textOf(await call('vspc_list_jobs', { company: C1 }))).total).toBe(0);
   });
 });
 

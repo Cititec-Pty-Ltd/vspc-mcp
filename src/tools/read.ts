@@ -1,7 +1,7 @@
-import type { Api } from '../client.js';
+import type { Api, Page } from '../client.js';
 import type { FilterExpression } from '../types.js';
 import { VspcApiError } from '../types.js';
-import { JOB_SOURCES, RESULT_STATUSES, companyFilter, findFailedJobs, groupFailures, jobCompanyFilter, jobCompanyUid, statusFilter } from './jobs.js';
+import { JOB_SOURCES, RESULT_STATUSES, companyFilter, findFailedJobs, groupFailures, jobBelongsTo, jobCompanyFilter, jobCompanyUid, statusFilter } from './jobs.js';
 import type { JobSource } from './jobs.js';
 import { Names, resolveCompany, safely } from './lookups.js';
 import type { ParamSpec, ReadSpec } from './spec.js';
@@ -48,6 +48,9 @@ const JOB_FIELDS = [
 /** License usage figures per workload (CurrentLicenseUsageWorkload, REST API 3.6.1). */
 const USAGE_FIELDS = ['usedUnits', 'newUnits', 'rentalUnits', 'usedCount', 'newCount', 'rentalCount'] as const;
 type UsageField = (typeof USAGE_FIELDS)[number];
+
+/** Most jobs read for one company in vspc_list_jobs (it pages them here; see there). */
+const MAX_COMPANY_JOBS = 5_000;
 
 /** Rows in vspc_failed_jobs_summary (Failed rows sort first; byCompany always counts every row). */
 const MAX_SUMMARY_ROWS = 120;
@@ -165,16 +168,30 @@ export const READ_SPECS: ReadSpec[] = [
       if (args.statuses) filter.push(statusFilter('status', args.statuses as string[]));
       if (typeof args.enabled === 'boolean') filter.push({ property: 'isEnabled', operation: 'equals', value: args.enabled });
       const path = args.backup_server_uid ? `/infrastructure/backupServers/${args.backup_server_uid}/jobs` : '/infrastructure/backupServers/jobs';
-      const p = await api.page(path, {
-        filter,
-        sort: [{ property: 'name', direction: 'ascending' }],
-        limit: args.limit as number,
-        offset: args.offset as number,
-      });
+      const sort = [{ property: 'name', direction: 'ascending' as const }];
+      const limit = args.limit as number;
+      const offset = args.offset as number;
+      let p: Page<Record<string, unknown>>;
+      let complete = true;
+      if (company) {
+        // VSPC can only pre-filter on either company field, which also returns hosted jobs to the
+        // server's owner. A company's jobs are few, so read them all, keep the ones whose effective
+        // company (jobCompanyUid) it is, and page here: total, count and nextOffset stay exact.
+        const all = await api.all<Record<string, unknown>>(path, { filter, sort }, { maxItems: MAX_COMPANY_JOBS });
+        complete = all.complete;
+        const mine = all.items.filter((j) => jobBelongsTo('backup_server', j, company.uid));
+        const items = mine.slice(offset, offset + limit);
+        p = { total: mine.length, count: items.length, offset, items };
+      } else {
+        p = await api.page(path, { filter, sort, limit, offset });
+      }
       const names = new Names(api);
       const [orgs, servers] = await Promise.all([safely(names.organizations()), safely(names.backupServers())]);
       return {
         ...paging(p),
+        ...(complete
+          ? {}
+          : { complete: false, note: `Only the first ${MAX_COMPANY_JOBS} matching jobs were read; narrow by backup server, status or name.` }),
         jobs: p.items.map((j) => {
           const owner = jobCompanyUid('backup_server', j);
           return {
