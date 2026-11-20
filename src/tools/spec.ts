@@ -1,5 +1,5 @@
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
-import { ConfigError, getConfig, makeApi, makeWriteApi, scrub } from '../client.js';
+import { ConfigError, getConfig, makeApi, makeWriteApi, scrub, writeRequestId } from '../client.js';
 import type { Api, WriteApi } from '../client.js';
 import { VspcAuthError, VspcRateLimitError } from '../types.js';
 import type { CallToolResult } from './types.js';
@@ -183,7 +183,10 @@ export async function runSpec(spec: ToolSpec, args: Record<string, unknown>): Pr
   if (!config) return missingConfigResult();
   try {
     const valid = validateArgs(spec, args);
-    const out = spec.kind === 'read' ? await spec.run(valid, makeApi(config)) : await spec.run(valid, makeWriteApi(config));
+    const out =
+      spec.kind === 'read'
+        ? await spec.run(valid, makeApi(config))
+        : await spec.run(valid, makeWriteApi(config, writeRequestId(spec.name, valid)));
     return textResult(redactSecrets(out));
   } catch (err) {
     const message = scrub((err as Error).message, config);

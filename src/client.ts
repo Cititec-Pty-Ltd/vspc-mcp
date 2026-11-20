@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Agent, fetch as undiciFetch } from 'undici';
 import { logger } from './utils/logger.js';
 import { fetchWithRateLimitRetry } from './rate-limit.js';
@@ -128,6 +128,40 @@ function errorDetail(body: string, config: VspcConfig): { message: string; code?
   return { message: scrub(body, config).replace(/\s+/g, ' ').slice(0, 200) };
 }
 
+/** JSON with object keys sorted at every level, so equal arguments always give the same text. */
+export function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    return `{${Object.keys(obj)
+      .filter((k) => obj[k] !== undefined)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/**
+ * The X-Request-id of a write: SHA-256 of the tool name and its canonical
+ * arguments, as an RFC 9562 version 8 (custom) UUID. VSPC treats a repeat
+ * with the same id within 5 minutes as the same request, so an identical
+ * write sent again (a lost response, a proposal approved twice) runs once.
+ */
+export function writeRequestId(tool: string, args: Record<string, unknown>): string {
+  const h = createHash('sha256').update(`${tool}\n${canonicalJson(args)}`).digest();
+  h[6] = (h[6] & 0x0f) | 0x80; // version 8
+  h[8] = (h[8] & 0x3f) | 0x80; // RFC 9562 variant
+  const hex = h.subarray(0, 16).toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+export interface RequestOptions {
+  timeoutMs?: number;
+  /** X-Request-id for a write (see writeRequestId); a random one if not given. Reads send none. */
+  requestId?: string;
+}
+
 /**
  * Sends one request and returns VSPC's envelope. `readOnly` (GET) requests
  * may be retried once after a short 429; writes never are.
@@ -138,13 +172,14 @@ export async function request<T = unknown>(
   method: 'GET' | 'POST',
   path: string,
   query: Query = {},
-  timeoutMs = 30_000
+  options: RequestOptions = {}
 ): Promise<VspcEnvelope<T>> {
+  const timeoutMs = options.timeoutMs ?? 30_000;
   const url = buildUrl(config.origin, path, query);
   const label = `${method} ${path}`;
   const readOnly = method === 'GET';
-  // A write gets a request id: VSPC treats a repeat with the same id within 5 minutes as the same request.
-  const requestId = readOnly ? undefined : randomUUID();
+  // A write carries an idempotency key: VSPC treats a repeat with the same id within 5 minutes as the same request.
+  const requestId = readOnly ? undefined : (options.requestId ?? randomUUID());
   let result;
   try {
     result = await fetchWithRateLimitRetry(fetchFor(config), url, label, readOnly, () => ({
@@ -281,10 +316,14 @@ export function makeApi(config: VspcConfig): Api {
   };
 }
 
-export function makeWriteApi(config: VspcConfig): WriteApi {
+/**
+ * Write access for one tool call. `requestId` (writeRequestId of the tool and
+ * its arguments) is sent as X-Request-id; each write tool makes one POST.
+ */
+export function makeWriteApi(config: VspcConfig, requestId?: string): WriteApi {
   return {
     async post<T>(path: string, query: Query = {}): Promise<T> {
-      const env = await request<T>(config, 'POST', path, query);
+      const env = await request<T>(config, 'POST', path, query, { requestId });
       return env.data;
     },
   };

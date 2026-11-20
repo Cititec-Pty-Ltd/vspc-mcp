@@ -4,8 +4,9 @@ import type { WriteSpec } from './spec.js';
  * Write tools. Each one is exactly one POST to a fixed VSPC endpoint with
  * validated UIDs, and no lookups first, so on the MCP host the proposal an
  * administrator approves is exactly what is sent. Never retried (a
- * rate-limited write returns the rate_limited error). Each request carries a
- * fresh X-Request-id, so VSPC itself ignores an accidental repeat within 5 min.
+ * rate-limited write returns the rate_limited error). Each request carries an
+ * X-Request-id derived from the tool and its arguments (client.writeRequestId), so VSPC
+ * runs an identical repeat within 5 min only once.
  * They need a key that is not read-only.
  */
 export const WRITE_SPECS: WriteSpec[] = [

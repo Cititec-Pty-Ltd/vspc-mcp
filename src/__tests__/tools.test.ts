@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ALL_SPECS, ALL_TOOLS, READ_TOOL_NAMES, WRITE_TOOL_NAMES, dispatchToolCall } from '../tools/index.js';
-import { parseVspcUrl, runWithConfig, setFetchForTests, scrub, buildUrl, getConfig } from '../client.js';
+import { parseVspcUrl, runWithConfig, setFetchForTests, scrub, buildUrl, getConfig, canonicalJson, writeRequestId } from '../client.js';
 import { baseJobName, groupFailures } from '../tools/jobs.js';
 import type { FailedJob } from '../tools/jobs.js';
 import { fakeVspc, filterOf, json, page, textOf } from './test-helpers.js';
@@ -452,6 +452,51 @@ describe('writes', () => {
     expect(vspc.calls).toHaveLength(1);
     expect((vspc.calls[0].init.headers as Record<string, string>)['X-Request-id']).toMatch(/^[0-9a-f-]{36}$/);
     expect((vspc.calls[0].init.headers as Record<string, string>)['X-Client-Version']).toBe('3.6.1');
+  });
+
+  it('derives the write request id from the tool and its arguments (idempotent within VSPC\'s 5 min)', async () => {
+    const ids: string[] = [];
+    const vspc = fakeVspc({
+      [`POST /infrastructure/backupServers/jobs/${J1}/start`]: (_u: URL, init: RequestInit) => {
+        ids.push((init.headers as Record<string, string>)['X-Request-id']);
+        return json({ data: null });
+      },
+      [`POST /infrastructure/backupServers/jobs/${J1}/retry`]: (_u: URL, init: RequestInit) => {
+        ids.push((init.headers as Record<string, string>)['X-Request-id']);
+        return json({ data: null });
+      },
+      [`POST /alarms/active/${AL1}/acknowledge`]: (_u: URL, init: RequestInit) => {
+        ids.push((init.headers as Record<string, string>)['X-Request-id']);
+        return json({ data: null });
+      },
+    });
+    setFetchForTests(vspc.fn);
+    await call('vspc_start_job', { job_uid: J1 });
+    await call('vspc_start_job', { job_uid: J1.toUpperCase() }); // same job: same id
+    await call('vspc_retry_job', { job_uid: J1 }); // other tool: other id
+    await call('vspc_acknowledge_alarm', { alarm_uid: AL1, comment: 'a' });
+    await call('vspc_acknowledge_alarm', { alarm_uid: AL1, comment: 'b' }); // other args: other id
+    await call('vspc_acknowledge_alarm', { comment: 'a', alarm_uid: AL1, on_client_portal: false }); // same after defaults
+    expect(ids[0]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(ids[1]).toBe(ids[0]);
+    expect(ids[2]).not.toBe(ids[0]);
+    expect(ids[4]).not.toBe(ids[3]);
+    expect(ids[5]).toBe(ids[3]);
+    expect(new Set(ids).size).toBe(4);
+  });
+
+  it('sends no request id on reads', async () => {
+    const vspc = fakeVspc({ '/about': json({ data: { serverVersion: '9.1' } }) });
+    setFetchForTests(vspc.fn);
+    await call('vspc_about');
+    await call('vspc_about');
+    for (const c of vspc.calls) expect((c.init.headers as Record<string, string>)['X-Request-id']).toBeUndefined();
+  });
+
+  it('builds canonical JSON and stable ids', () => {
+    expect(canonicalJson({ b: 1, a: { d: [2, { y: 1, x: 2 }], c: 'z' }, u: undefined })).toBe('{"a":{"c":"z","d":[2,{"x":2,"y":1}]},"b":1}');
+    expect(writeRequestId('t', { a: 1, b: 2 })).toBe(writeRequestId('t', { b: 2, a: 1 }));
+    expect(writeRequestId('t', { a: 1 })).not.toBe(writeRequestId('u', { a: 1 }));
   });
 
   it('acknowledges an alarm with its comment', async () => {

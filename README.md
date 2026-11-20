@@ -51,7 +51,9 @@ If one source fails (for example, the key's user cannot see VB365), the others a
 
 ### Write tools
 
-Each write tool makes exactly one POST to a fixed endpoint, with a validated UID and no lookups first. On the Cititec MCP host, the proposal an administrator approves is exactly what is sent. Writes are **never retried**. Each one carries a fresh `X-Request-id`, so VSPC itself treats a repeat within 5 minutes as the same request. They need a key that is not read-only.
+Each write tool makes exactly one POST to a fixed endpoint, with a validated UID and no lookups first. On the Cititec MCP host, the proposal an administrator approves is exactly what is sent. Writes are **never retried**. They need a key that is not read-only.
+
+**Idempotency.** VSPC treats `X-Request-id` as an idempotency key for 5 minutes. A write's id is derived from the tool name and its validated arguments (canonical JSON, keys sorted; SHA-256 shown as a version 8 UUID). If an identical write is sent again within 5 minutes, VSPC runs it once. Examples: a response lost on the network and sent again, or the same proposal approved twice. A different job, alarm or comment gets a different id. So does the same write more than 5 minutes later. Starting the same job twice on purpose within 5 minutes therefore runs it once. Reads send no request id.
 
 | Tool | VSPC endpoint |
 |------|---------------|
