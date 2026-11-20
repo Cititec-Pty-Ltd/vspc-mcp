@@ -1,7 +1,7 @@
 {
   "name": "@cititec-pty-ltd/vspc-mcp",
   "version": "0.1.0",
-  "description": "MCP server for the Veeam Service Provider Console (VSPC) REST API v3: companies, backup servers, jobs, failures, alarms, licensing",
+  "description": "MCP server for the Veeam Service Provider Console (VSPC) REST API v3, for VCSP (Veeam Cloud Service Provider) partners: companies, backup servers, jobs, failures, alarms, licensing",
   "type": "module",
   "main": "./dist/index.js",
   "bin": {
@@ -24,6 +24,7 @@
   "keywords": [
     "veeam",
     "vspc",
+    "vcsp",
     "veeam-service-provider-console",
     "backup",
     "mcp",

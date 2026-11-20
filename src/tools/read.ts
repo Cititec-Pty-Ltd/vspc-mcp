@@ -307,7 +307,7 @@ export const READ_SPECS: ReadSpec[] = [
     name: 'vspc_failed_jobs_summary',
     kind: 'read',
     description:
-      'Summary of backup failures across ALL companies in the last N hours: one row per job (retries of the same job, and one agent job failing on several computers of a company, are folded together, worst result first), counts per company, and VSPC\'s session counts (successful, warning, failed sessions) for the window. The best first call for "which backups failed in the last 24 hours?".',
+      'Summary of backup failures across ALL companies (VCSP / Veeam Cloud Service Provider clients) in the last N hours: one row per job (retries of the same job, and one agent job failing on several computers of a company, are folded together, worst result first), counts per company, and VSPC\'s session counts (successful, warning, failed sessions) for the window. The best first call for "which backups failed in the last 24 hours?".',
     params: {
       hours: { type: 'int', min: 1, max: 720, default: 24, description: 'Look-back window in hours (default 24).' },
       include_warnings: { type: 'boolean', default: false, description: 'Also include jobs whose latest session ended with a warning.' },
@@ -501,7 +501,7 @@ export const READ_SPECS: ReadSpec[] = [
     name: 'vspc_get_license_usage',
     kind: 'read',
     description:
-      'Current license usage by organization and server (Veeam Backup & Replication, Cloud Connect, VB365, VSPC, Veeam ONE): per workload type the used, new and rental units and counts, plus totals per workload across the result. Optionally one company.',
+      'VCSP (Veeam Cloud Service Provider) licence usage, as reported to Veeam under the VCSP programme: current license usage by organization and server (Veeam Backup & Replication, Cloud Connect, VB365, VSPC, Veeam ONE): per workload type the used, new and rental units and counts, plus totals per workload across the result. Optionally one company.',
     params: {
       company: COMPANY,
       server_type: { type: 'string', enum: ['BackupAndReplication', 'CloudConnect', 'VSPC', 'VONE', 'VB365'], description: 'Only usage on servers of this product.' },

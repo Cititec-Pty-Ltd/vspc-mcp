@@ -2,6 +2,8 @@
 
 An MCP server for the [Veeam Service Provider Console](https://www.veeam.com/service-provider-console.html) (VSPC) REST API v3. VSPC sees every client's Veeam Backup & Replication servers, Veeam Agents and Veeam Backup for Microsoft 365 servers, so Claude can answer questions across all clients in one call, for example "which backups failed in the last 24 hours?". Separately named write tools can start or retry a job and acknowledge or resolve an alarm.
 
+**VCSP vs VSPC.** VCSP (Veeam Cloud Service Provider) is Veeam's partner programme. VSPC is the console a VCSP partner uses to manage its clients' Veeam, and it is what these tools read. Questions about either belong here. In particular, `vspc_get_license_usage` gives the licence usage (points and instances) that is reported to Veeam under the VCSP programme.
+
 It uses the same framework as Cititec's other MCP servers: TypeScript, `@modelcontextprotocol/sdk`, a stdio transport, vitest tests, tsup and a Docker image.
 
 ## The API

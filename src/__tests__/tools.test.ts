@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ALL_SPECS, ALL_TOOLS, READ_TOOL_NAMES, WRITE_TOOL_NAMES, dispatchToolCall } from '../tools/index.js';
+import { SERVER_INSTRUCTIONS } from '../server.js';
 import { parseVspcUrl, runWithConfig, setFetchForTests, scrub, buildUrl, getConfig, canonicalJson, writeRequestId } from '../client.js';
 import { baseJobName, groupFailures } from '../tools/jobs.js';
 import { MAX_NAME_MATCHES, NAME_CACHE_TTL_MS, clearNameCacheForTests, nameOrUid } from '../tools/lookups.js';
@@ -36,6 +37,14 @@ const ORGS = page([
 const SERVERS = page([{ instanceUid: S1, name: 'VBR-01', organizationUid: C1, status: 'Healthy', displayVersion: '12.3.1' }]);
 
 describe('tool table', () => {
+  it('can be found by "VCSP" (the partner programme) as well as "VSPC" (the console)', () => {
+    expect(SERVER_INSTRUCTIONS).toContain('VCSP (Veeam Cloud Service Provider)');
+    expect(SERVER_INSTRUCTIONS).toContain('Veeam Service Provider Console (VSPC)');
+    const desc = (n: string) => ALL_TOOLS.find((t) => t.name === n)!.description!;
+    expect(desc('vspc_failed_jobs_summary')).toContain('VCSP');
+    expect(desc('vspc_get_license_usage')).toContain('VCSP (Veeam Cloud Service Provider)');
+  });
+
   it('has unique names, strict schemas and the right hints', () => {
     const names = ALL_TOOLS.map((t) => t.name);
     expect(new Set(names).size).toBe(names.length);
