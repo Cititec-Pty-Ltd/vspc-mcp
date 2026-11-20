@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ALL_SPECS, ALL_TOOLS, READ_TOOL_NAMES, WRITE_TOOL_NAMES, dispatchToolCall } from '../tools/index.js';
 import { parseVspcUrl, runWithConfig, setFetchForTests, scrub, buildUrl, getConfig, canonicalJson, writeRequestId } from '../client.js';
 import { baseJobName, groupFailures } from '../tools/jobs.js';
-import { nameOrUid } from '../tools/lookups.js';
+import { MAX_NAME_MATCHES, NAME_CACHE_TTL_MS, clearNameCacheForTests, nameOrUid } from '../tools/lookups.js';
 import type { FailedJob } from '../tools/jobs.js';
 import { fakeVspc, filterOf, json, page, textOf } from './test-helpers.js';
 
@@ -16,6 +16,8 @@ const A1 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1';
 const A2 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2';
 const J1 = 'cccccccc-cccc-4ccc-8ccc-ccccccccccc1';
 const AL1 = 'dddddddd-dddd-4ddd-8ddd-ddddddddddd1';
+
+beforeEach(() => clearNameCacheForTests());
 
 afterEach(() => {
   setFetchForTests();
@@ -680,6 +682,84 @@ describe('names fall back to UIDs', () => {
     expect(nameOrUid(undefined, C3)).toBe(C3); // lookup failed
     expect(nameOrUid(m, '')).toBeUndefined();
     expect(nameOrUid(m, null)).toBeUndefined();
+  });
+});
+
+describe('company names', () => {
+  const many = (n: number, from = 0) =>
+    Array.from({ length: n }, (_, i) => ({ instanceUid: `00000000-0000-4000-8000-${String(from + i).padStart(12, '0')}`, name: `Acme ${from + i}` }));
+
+  it('reads every match before deciding, so an exact match on a later page wins', async () => {
+    const exactUid = '99999999-9999-4999-8999-999999999999';
+    const vspc = fakeVspc({
+      '/organizations/companies': (url) => {
+        expect(url.searchParams.get('limit')).toBe('500');
+        const offset = Number(url.searchParams.get('offset'));
+        return offset === 0 ? page(many(500), 600, 0) : page([...many(99, 500), { instanceUid: exactUid, name: 'Acme' }], 600, 500);
+      },
+      '/infrastructure/backupServers/jobs': (url) => {
+        expect(JSON.stringify(filterOf(url))).toContain(exactUid);
+        return page([]);
+      },
+      '/organizations': ORGS,
+      '/infrastructure/backupServers': SERVERS,
+    });
+    setFetchForTests(vspc.fn);
+    const r = await call('vspc_list_jobs', { company: 'ACME' });
+    expect(r.isError).toBeUndefined();
+    expect(vspc.calls.filter((c) => c.path === '/organizations/companies')).toHaveLength(2);
+  });
+
+  it('says how many matched, and that not all were read, past the cap', async () => {
+    const vspc = fakeVspc({
+      '/organizations/companies': (url) => {
+        const offset = Number(url.searchParams.get('offset'));
+        return page(many(500, offset), 2_500, offset);
+      },
+    });
+    setFetchForTests(vspc.fn);
+    const text = textOf(await call('vspc_list_jobs', { company: 'acme' }));
+    expect(text).toContain('matches 2500 companies');
+    expect(text).toContain(`only the first ${MAX_NAME_MATCHES} were read`);
+    expect(vspc.calls.filter((c) => c.path === '/organizations/companies')).toHaveLength(MAX_NAME_MATCHES / 500);
+  });
+});
+
+describe('name cache', () => {
+  const serversRoute = page([{ instanceUid: S1, name: 'VBR-01', organizationUid: C1 }]);
+  const orgCalls = (vspc: ReturnType<typeof fakeVspc>) => vspc.calls.filter((c) => c.path === '/organizations').length;
+
+  it('reuses the organisation list across tool calls, until it expires', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const vspc = fakeVspc({ '/infrastructure/backupServers': serversRoute, '/organizations': ORGS });
+    setFetchForTests(vspc.fn);
+    expect(JSON.parse(textOf(await call('vspc_list_backup_servers'))).backupServers[0].company).toBe('Client One');
+    await call('vspc_list_backup_servers');
+    expect(orgCalls(vspc)).toBe(1);
+    vi.setSystemTime(Date.now() + NAME_CACHE_TTL_MS + 1);
+    await call('vspc_list_backup_servers');
+    expect(orgCalls(vspc)).toBe(2);
+  });
+
+  it('does not keep a failed lookup', async () => {
+    let n = 0;
+    const vspc = fakeVspc({
+      '/infrastructure/backupServers': serversRoute,
+      '/organizations': () => (n++ === 0 ? json({ data: null, errors: [{ message: 'busy' }] }, 500) : ORGS.clone()),
+    });
+    setFetchForTests(vspc.fn);
+    expect(JSON.parse(textOf(await call('vspc_list_backup_servers'))).backupServers[0].company).toBe(C1);
+    expect(JSON.parse(textOf(await call('vspc_list_backup_servers'))).backupServers[0].company).toBe('Client One');
+    expect(orgCalls(vspc)).toBe(2);
+  });
+
+  it('keeps consoles and keys apart', async () => {
+    const vspc = fakeVspc({ '/infrastructure/backupServers': serversRoute, '/organizations': ORGS });
+    setFetchForTests(vspc.fn);
+    await call('vspc_list_backup_servers');
+    await runWithConfig({ ...config, apiKey: 'ANOTHER-KEY-0123456789' }, () => dispatchToolCall('vspc_list_backup_servers', {}));
+    await runWithConfig({ ...config, origin: 'https://other.test:1280' }, () => dispatchToolCall('vspc_list_backup_servers', {}));
+    expect(orgCalls(vspc)).toBe(3);
   });
 });
 

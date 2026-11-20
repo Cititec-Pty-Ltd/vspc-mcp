@@ -251,6 +251,8 @@ export interface ListOptions {
 
 /** The read-only API handed to tools. Every method is a GET, except `post`. */
 export interface Api {
+  /** Identifies the console and key (URL + SHA-256 of the key, never the key), for caches. */
+  readonly cacheKey: string;
   get<T = unknown>(path: string, query?: Query): Promise<T>;
   page<T = Record<string, unknown>>(path: string, options?: ListOptions): Promise<Page<T>>;
   /**
@@ -293,6 +295,7 @@ export function makeApi(config: VspcConfig): Api {
     return { ...pagingOf(env, offset, items.length), items };
   };
   return {
+    cacheKey: `${config.origin}|${createHash('sha256').update(config.apiKey).digest('hex').slice(0, 16)}`,
     async get<T>(path: string, query: Query = {}): Promise<T> {
       const env = await request<T>(config, 'GET', path, query);
       return env.data;
