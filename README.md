@@ -35,7 +35,7 @@ Read tools only send GET requests. Results are trimmed to the useful fields. Com
 | `vspc_list_agent_jobs` | `GET /infrastructure/backupAgents/jobs` (Veeam Agent jobs and backup policies, with computer names) |
 | `vspc_list_failed_jobs` | All three job lists, filtered on the latest result (Failed, optionally Warning) and paged through: every failure in the last N hours across all companies, newest first, with the failure reason |
 | `vspc_failed_jobs_summary` | As above, one row per job. Retries of a job, and an agent job failing on several computers of one company, are folded together. Also gives counts per company and the session counts from `GET /infrastructure/jobSessionHeatmap/` |
-| `vspc_list_alarms` | `GET /alarms/active` (Error and Warning by default, newest first), with alarm names from `GET /alarms/templates` |
+| `vspc_list_alarms` | `GET /alarms/active` (Error and Warning by default, newest first), with alarm names from `GET /alarms/templates`. `hours` is sent to VSPC as a `lastActivation.time` filter, so paging is exact. If the console refuses that filter, the window is applied here instead: `timeFilter: "client"` with `count`, `pageCountUnfiltered`, and no `nextOffset` once the page reaches older alarms |
 | `vspc_list_protected_vms` | `GET /protectedWorkloads/virtualMachines` (`oldest_first` finds stale backups) |
 | `vspc_list_backup_policies` | `GET /configuration/backupPolicies` |
 | `vspc_get_license_usage` | `GET /licensing/usage/organizations`, with totals per workload |

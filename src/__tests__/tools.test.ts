@@ -273,37 +273,93 @@ describe('paging and lists', () => {
     expect(text).toContain('Acme South');
   });
 
-  it('lists active alarms with template names', async () => {
+  describe('alarms', () => {
     const now = Date.now();
-    const vspc = fakeVspc({
-      '/alarms/active': (url) => {
-        expect(filterOf(url)).toEqual([
-          { operation: 'or', items: [{ property: 'lastActivation.status', operation: 'equals', value: 'Error' }, { property: 'lastActivation.status', operation: 'equals', value: 'Warning' }] },
-        ]);
-        expect(JSON.parse(url.searchParams.get('sort')!)).toEqual([{ property: 'lastActivation.time', direction: 'descending' }]);
-        return page([
-          {
-            instanceUid: AL1,
-            alarmTemplateUid: 'T1',
-            repeatCount: 3,
-            object: { type: 'BackupServerJob', organizationUid: C2, computerName: 'VBR-02', objectName: 'Nightly' },
-            lastActivation: { time: new Date(now - 3_600_000).toISOString(), status: 'Error', message: 'Job failed' },
-          },
-          {
-            instanceUid: 'old',
-            alarmTemplateUid: 'T1',
-            object: { organizationUid: C2 },
-            lastActivation: { time: new Date(now - 100 * 3_600_000).toISOString(), status: 'Error' },
-          },
-        ]);
-      },
-      '/alarms/templates': page([{ instanceUid: 't1', name: 'Job state' }]),
-      '/organizations': ORGS,
+    const STATUS_FILTER = {
+      operation: 'or',
+      items: [{ property: 'lastActivation.status', operation: 'equals', value: 'Error' }, { property: 'lastActivation.status', operation: 'equals', value: 'Warning' }],
+    };
+    const recent = (id: string, h: number) => ({
+      instanceUid: id,
+      alarmTemplateUid: 'T1',
+      repeatCount: 3,
+      object: { type: 'BackupServerJob', organizationUid: C2, computerName: 'VBR-02', objectName: 'Nightly' },
+      lastActivation: { time: new Date(now - h * 3_600_000).toISOString(), status: 'Error', message: 'Job failed' },
     });
-    setFetchForTests(vspc.fn);
-    const out = JSON.parse(textOf(await call('vspc_list_alarms', { hours: 24 })));
-    expect(out.alarms).toHaveLength(1);
-    expect(out.alarms[0]).toMatchObject({ alarm: 'Job state', status: 'Error', company: 'Client Two', computer: 'VBR-02', objectName: 'Nightly' });
+    const common = { '/alarms/templates': page([{ instanceUid: 't1', name: 'Job state' }]), '/organizations': ORGS };
+
+    it('lists them with template names, newest first', async () => {
+      const vspc = fakeVspc({
+        ...common,
+        '/alarms/active': (url) => {
+          expect(filterOf(url)).toEqual([STATUS_FILTER]);
+          expect(JSON.parse(url.searchParams.get('sort')!)).toEqual([{ property: 'lastActivation.time', direction: 'descending' }]);
+          return page([recent(AL1, 1)], 3);
+        },
+      });
+      setFetchForTests(vspc.fn);
+      const out = JSON.parse(textOf(await call('vspc_list_alarms', { limit: 1 })));
+      expect(out).toMatchObject({ total: 3, count: 1, offset: 0, nextOffset: 1 });
+      expect(out.timeFilter).toBeUndefined();
+      expect(out.alarms[0]).toMatchObject({ alarm: 'Job state', status: 'Error', company: 'Client Two', computer: 'VBR-02', objectName: 'Nightly' });
+    });
+
+    it('sends the time window to VSPC, so paging is exact', async () => {
+      const vspc = fakeVspc({
+        ...common,
+        '/alarms/active': (url) => {
+          const f = filterOf(url) as Record<string, unknown>[];
+          expect(f[0]).toEqual(STATUS_FILTER);
+          expect(f[1]).toMatchObject({ property: 'lastActivation.time', operation: 'greaterThanOrEqual' });
+          const cutoff = Date.parse(String(f[1].value));
+          expect(Math.abs(cutoff - (now - 24 * 3_600_000))).toBeLessThan(60_000);
+          return page([recent(AL1, 1), recent('a2', 2)], 5);
+        },
+      });
+      setFetchForTests(vspc.fn);
+      const out = JSON.parse(textOf(await call('vspc_list_alarms', { hours: 24, limit: 2 })));
+      expect(out).toMatchObject({ total: 5, count: 2, offset: 0, nextOffset: 2, timeFilter: 'vspc' });
+      expect(out.alarms).toHaveLength(2);
+    });
+
+    it('falls back to filtering here when VSPC refuses the date filter, with honest paging', async () => {
+      const vspc = fakeVspc({
+        ...common,
+        '/alarms/active': (url) => {
+          const f = filterOf(url) as unknown[];
+          if (f.length === 2) return json({ data: null, errors: [{ message: 'Unsupported filter', code: 400 }] }, 400);
+          return page([recent(AL1, 1), recent('old', 100)], 7);
+        },
+      });
+      setFetchForTests(vspc.fn);
+      const out = JSON.parse(textOf(await call('vspc_list_alarms', { hours: 24, limit: 2 })));
+      expect(out).toMatchObject({ totalUnfiltered: 7, count: 1, pageCountUnfiltered: 2, offset: 0, timeFilter: 'client' });
+      // newest first: the page reached an alarm outside the window, so nothing later can be in it
+      expect(out.nextOffset).toBeUndefined();
+      expect(out.alarms.map((a: { instanceUid: string }) => a.instanceUid)).toEqual([AL1]);
+      expect(out.alarms).toHaveLength(out.count);
+    });
+
+    it('keeps a followable nextOffset when the whole fallback page is in the window', async () => {
+      const vspc = fakeVspc({
+        ...common,
+        '/alarms/active': (url) =>
+          (filterOf(url) as unknown[]).length === 2
+            ? json({ data: null, errors: [{ message: 'Unsupported filter', code: 400 }] }, 400)
+            : page([recent(AL1, 1), recent('a2', 2)], 7),
+      });
+      setFetchForTests(vspc.fn);
+      const out = JSON.parse(textOf(await call('vspc_list_alarms', { hours: 24, limit: 2 })));
+      expect(out).toMatchObject({ count: 2, pageCountUnfiltered: 2, nextOffset: 2, timeFilter: 'client' });
+    });
+
+    it('does not hide other errors behind the fallback', async () => {
+      const vspc = fakeVspc({ ...common, '/alarms/active': json({ data: null, errors: [{ message: 'boom', code: 500 }] }, 500) });
+      setFetchForTests(vspc.fn);
+      const r = await call('vspc_list_alarms', { hours: 24 });
+      expect(r.isError).toBe(true);
+      expect(vspc.calls.filter((c) => c.path === '/alarms/active')).toHaveLength(1);
+    });
   });
 
   it('totals license usage per workload', async () => {

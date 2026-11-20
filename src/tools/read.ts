@@ -1,5 +1,6 @@
 import type { Api } from '../client.js';
 import type { FilterExpression } from '../types.js';
+import { VspcApiError } from '../types.js';
 import { JOB_SOURCES, RESULT_STATUSES, companyFilter, findFailedJobs, groupFailures, statusFilter } from './jobs.js';
 import type { JobSource } from './jobs.js';
 import { Names, resolveCompany, safely } from './lookups.js';
@@ -318,21 +319,39 @@ export const READ_SPECS: ReadSpec[] = [
       const company = await companyOf(api, args);
       const filter: FilterExpression[] = [statusFilter('lastActivation.status', args.statuses as string[])];
       if (company) filter.push({ property: 'object.organizationUid', operation: 'equals', value: company.uid });
-      const p = await api.page('/alarms/active', {
-        filter,
-        sort: [{ property: 'lastActivation.time', direction: 'descending' }],
-        limit: args.limit as number,
-        offset: args.offset as number,
-      });
       const since = typeof args.hours === 'number' ? Date.now() - (args.hours as number) * 3_600_000 : undefined;
+      const query = (f: FilterExpression[]) =>
+        api.page('/alarms/active', {
+          filter: f,
+          sort: [{ property: 'lastActivation.time', direction: 'descending' }],
+          limit: args.limit as number,
+          offset: args.offset as number,
+        });
+      // The time window goes to VSPC, so total, count and nextOffset are exact. If the console
+      // refuses a date comparison (HTTP 400), filter here instead and say so (see the paging below).
+      let timeFilter: 'vspc' | 'client' | undefined = since === undefined ? undefined : 'vspc';
+      let p;
+      try {
+        p = await query(
+          since === undefined
+            ? filter
+            : [...filter, { property: 'lastActivation.time', operation: 'greaterThanOrEqual', value: new Date(since).toISOString() }]
+        );
+      } catch (err) {
+        if (!(since !== undefined && err instanceof VspcApiError && err.httpStatus === 400)) throw err;
+        timeFilter = 'client';
+        p = await query(filter);
+      }
       const names = new Names(api);
       const [orgs, templates] = await Promise.all([
         safely(names.organizations()),
         safely(api.all<Record<string, unknown>>('/alarms/templates', {}, { maxItems: 5_000 })),
       ]);
       const templateName = new Map((templates?.items ?? []).map((t) => [String(t.instanceUid ?? '').toLowerCase(), String(t.name ?? '')]));
+      const inWindow = (a: Record<string, unknown>) =>
+        since === undefined || (timeOf((a.lastActivation as Record<string, unknown>)?.time) ?? 0) >= since;
       const alarms = p.items
-        .filter((a) => since === undefined || (timeOf((a.lastActivation as Record<string, unknown>)?.time) ?? 0) >= since)
+        .filter(inWindow)
         .map((a) => {
           const last = (a.lastActivation ?? {}) as Record<string, unknown>;
           const obj = (a.object ?? {}) as Record<string, unknown>;
@@ -349,9 +368,24 @@ export const READ_SPECS: ReadSpec[] = [
             repeatCount: a.repeatCount,
           };
         });
+      if (timeFilter !== 'client' && alarms.length === p.items.length) {
+        return { ...paging(p), ...(timeFilter ? { timeFilter } : {}), alarms };
+      }
+      // Filtered here: `count` is what this page shows, `pageCountUnfiltered` what VSPC returned.
+      // Alarms come newest first, so once this page reaches one outside the window there is
+      // nothing later to page to; otherwise nextOffset follows VSPC's (unfiltered) paging.
+      const nextRaw = p.offset + p.count;
+      const reachedWindowEnd = p.items.some((a) => !inWindow(a));
       return {
-        ...paging(p),
-        ...(since !== undefined ? { shownAfterTimeFilter: alarms.length } : {}),
+        totalUnfiltered: p.total,
+        count: alarms.length,
+        pageCountUnfiltered: p.count,
+        offset: p.offset,
+        ...(!reachedWindowEnd && nextRaw < p.total ? { nextOffset: nextRaw } : {}),
+        timeFilter: 'client',
+        note: reachedWindowEnd
+          ? 'Time filter applied after fetching; this page reached alarms older than the window, so there are no more in it.'
+          : 'Time filter applied after fetching; a page can show fewer alarms than limit. Follow nextOffset for more.',
         alarms,
       };
     },
