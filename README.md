@@ -47,7 +47,11 @@ Job sources in the failure tools:
 - `agent`: Veeam Agents managed by VSPC.
 - `vb365`: Veeam Backup for Microsoft 365 jobs.
 
-If one source fails (for example, the key's user cannot see VB365), the others are still returned. The failed source is reported under `scanned`.
+A failure count is never shown as a clean zero when data is missing:
+
+- If no source can be read (for example, the console is unreachable), the tool returns an error giving each source's reason. A rate-limit wait is kept, as `rate_limited`.
+- If some sources fail, or one is cut short at its cap, the result starts with `complete: false` and a `warning`: the counts are a lower bound, and zero does not mean no failures. The result lists `sourceErrors` and `partialSources`.
+- If VSPC's session counts cannot be read, the summary returns `sessionCounts: null` and gives the reason.
 
 ### Write tools
 

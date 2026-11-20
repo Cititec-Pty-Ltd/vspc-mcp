@@ -488,6 +488,89 @@ describe('failed jobs', () => {
     const out = JSON.parse(textOf(await call('vspc_list_failed_jobs', {})));
     expect(out.count).toBe(3);
     expect(out.scanned.vb365.error).toContain('HTTP 403');
+    expect(out.complete).toBe(false);
+    expect(out.warning).toMatch(/^INCOMPLETE: could not read vb365\..*zero does not mean no failures/);
+    expect(out.sourceErrors).toEqual([{ source: 'vb365', error: expect.stringContaining('HTTP 403') }]);
+  });
+
+  it('marks a complete read as complete', async () => {
+    setFetchForTests(fakeVspc(failureRoutes()).fn);
+    const out = JSON.parse(textOf(await call('vspc_list_failed_jobs', {})));
+    expect(out.complete).toBe(true);
+    expect(out.warning).toBeUndefined();
+  });
+
+  // What the first live run hit: the console's name did not resolve, so every request failed.
+  const unreachable = () => {
+    throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND', message: 'getaddrinfo ENOTFOUND vspc.example.local' } });
+  };
+
+  it('is an error, not zero failures, when no source can be read', async () => {
+    setFetchForTests(async () => unreachable());
+    for (const tool of ['vspc_failed_jobs_summary', 'vspc_list_failed_jobs']) {
+      const r = await call(tool, {});
+      expect(r.isError).toBe(true);
+      const text = textOf(r);
+      expect(text).toContain('No job source could be read, so failures are unknown (not zero)');
+      for (const s of ['backup_server:', 'agent:', 'vb365:']) expect(text).toContain(s);
+      expect(text).toContain('ENOTFOUND');
+      expect(text).toContain('in lower case');
+      expect(text).not.toContain('failingJobs');
+    }
+  });
+
+  it('keeps the rate-limit wait when every source is rate limited', async () => {
+    setFetchForTests(async () => json({}, 429, { 'Retry-After': '120' }));
+    const r = await call('vspc_failed_jobs_summary', {});
+    expect(r.isError).toBe(true);
+    expect(r.structuredContent).toEqual({ error: 'rate_limited', retryAfterSeconds: 120 });
+  });
+
+  it('the summary says it is incomplete, and a zero is not a clean zero', async () => {
+    const vspc = fakeVspc(
+      failureRoutes({
+        '/infrastructure/backupServers/jobs': json({ data: null, errors: [{ message: 'Server unavailable' }] }, 500),
+        '/infrastructure/backupAgents/jobs': page([]),
+        '/infrastructure/vb365Servers/organizations/jobs': page([]),
+        '/infrastructure/jobSessionHeatmap/': json({ data: { successJobsCount: 5, warningJobsCount: 0, failJobsCount: 2 } }),
+      })
+    );
+    setFetchForTests(vspc.fn);
+    const out = JSON.parse(textOf(await call('vspc_failed_jobs_summary', {})));
+    expect(out.failingJobs).toBe(0);
+    expect(out.complete).toBe(false);
+    expect(out.warning).toContain('could not read backup_server');
+    expect(out.warning).toContain('zero does not mean no failures');
+    expect(out.sourceErrors[0]).toMatchObject({ source: 'backup_server', error: expect.stringContaining('Server unavailable') });
+    // Output order: the coverage verdict comes before any count
+    expect(Object.keys(out).indexOf('complete')).toBeLessThan(Object.keys(out).indexOf('failingJobs'));
+  });
+
+  it('says when a source was cut short at the cap', async () => {
+    const many = (n: number, from: number) =>
+      Array.from({ length: n }, (_, i) => ({ instanceUid: `j${from + i}`, name: `Job ${from + i}`, status: 'Failed', lastEndTime: ago(1) }));
+    const vspc = fakeVspc({
+      '/infrastructure/backupServers/jobs': (url) => {
+        const offset = Number(url.searchParams.get('offset'));
+        return page(many(500, offset), 3_000, offset);
+      },
+      '/organizations': ORGS,
+      '/infrastructure/backupServers': SERVERS,
+    });
+    setFetchForTests(vspc.fn);
+    const out = JSON.parse(textOf(await call('vspc_list_failed_jobs', { sources: ['backup_server'] })));
+    expect(out.count).toBe(2_000);
+    expect(out.complete).toBe(false);
+    expect(out.partialSources).toEqual(['backup_server']);
+    expect(out.warning).toContain('read only part of backup_server');
+  });
+
+  it('says when the session counts could not be read', async () => {
+    setFetchForTests(fakeVspc(failureRoutes({ '/infrastructure/jobSessionHeatmap/': json({}, 500) })).fn);
+    const out = JSON.parse(textOf(await call('vspc_failed_jobs_summary', {})));
+    expect(out.sessionCounts).toBeNull();
+    expect(out.sessionCountsError).toContain('could not be read');
+    expect(out.complete).toBe(true);
   });
 
   it('only asks the given backup server', async () => {

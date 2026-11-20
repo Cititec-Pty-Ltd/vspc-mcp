@@ -2,7 +2,7 @@ import type { Api, Page } from '../client.js';
 import type { FilterExpression } from '../types.js';
 import { VspcApiError } from '../types.js';
 import { JOB_SOURCES, RESULT_STATUSES, companyFilter, findFailedJobs, groupFailures, jobBelongsTo, jobCompanyFilter, jobCompanyUid, statusFilter } from './jobs.js';
-import type { JobSource } from './jobs.js';
+import type { FailedJobsResult, JobSource } from './jobs.js';
 import { Names, nameOrUid, resolveCompany, safely } from './lookups.js';
 import type { ParamSpec, ReadSpec } from './spec.js';
 import { hoursAgo, oneLine, pick, timeOf } from './shared.js';
@@ -51,6 +51,26 @@ type UsageField = (typeof USAGE_FIELDS)[number];
 
 /** Most jobs read for one company in vspc_list_jobs (it pages them here; see there). */
 const MAX_COMPANY_JOBS = 5_000;
+
+/**
+ * What a failure result covers, put first in the output. When a source could
+ * not be read (or was cut short), `complete` is false and `warning` says the
+ * counts are a lower bound, so a zero is never read as "no failures".
+ */
+function coverage(r: FailedJobsResult): Record<string, unknown> {
+  if (r.complete) return { complete: true };
+  const missing = r.sourceErrors.map((e) => e.source);
+  const parts = [
+    missing.length ? `could not read ${missing.join(', ')}` : '',
+    r.partialSources.length ? `read only part of ${r.partialSources.join(', ')}` : '',
+  ].filter(Boolean);
+  return {
+    complete: false,
+    warning: `INCOMPLETE: ${parts.join('; ')}. The counts below cover only what was read: they are a lower bound, and zero does not mean no failures.`,
+    ...(r.sourceErrors.length ? { sourceErrors: r.sourceErrors } : {}),
+    ...(r.partialSources.length ? { partialSources: r.partialSources } : {}),
+  };
+}
 
 /** Rows in vspc_failed_jobs_summary (Failed rows sort first; byCompany always counts every row). */
 const MAX_SUMMARY_ROWS = 120;
@@ -272,13 +292,14 @@ export const READ_SPECS: ReadSpec[] = [
         backupServerUid: args.backup_server_uid as string | undefined,
       });
       return {
+        ...coverage(r),
         window: r.window,
         statuses: r.statuses,
         count: r.jobs.length,
         ...(r.jobs.length > (args.max_rows as number) ? { shown: args.max_rows, more: 'Narrow by company, sources or hours, or use vspc_failed_jobs_summary.' } : {}),
         jobs: r.jobs.slice(0, args.max_rows as number),
         scanned: r.scanned,
-        note: 'Latest session per job only (VSPC keeps no session history). Incomplete sources are marked complete: false.',
+        note: 'Latest session per job only (VSPC keeps no session history).',
       };
     },
   },
@@ -313,8 +334,13 @@ export const READ_SPECS: ReadSpec[] = [
         perCompany.set(k, c);
       }
       return {
+        ...coverage(r),
         window: r.window,
-        ...(heat ? { sessionCounts: pick(heat, ['successJobsCount', 'warningJobsCount', 'failJobsCount']) } : {}),
+        ...(heat
+          ? { sessionCounts: pick(heat, ['successJobsCount', 'warningJobsCount', 'failJobsCount']) }
+          : company
+            ? {}
+            : { sessionCounts: null, sessionCountsError: 'VSPC\'s session counts could not be read for this window.' }),
         failingJobs: groups.length,
         byCompany: [...perCompany.entries()]
           .map(([name, c]) => ({ company: name, ...c }))
