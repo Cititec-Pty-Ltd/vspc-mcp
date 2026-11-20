@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ALL_SPECS, ALL_TOOLS, READ_TOOL_NAMES, WRITE_TOOL_NAMES, dispatchToolCall } from '../tools/index.js';
+import { SERVER_INSTRUCTIONS } from '../server.js';
 import { parseVspcUrl, runWithConfig, setFetchForTests, scrub, buildUrl, getConfig, canonicalJson, writeRequestId } from '../client.js';
 import { baseJobName, groupFailures } from '../tools/jobs.js';
-import { MAX_NAME_MATCHES, NAME_CACHE_TTL_MS, clearNameCacheForTests, nameOrUid } from '../tools/lookups.js';
+import { MAX_AGENT_LOOKUPS, MAX_NAME_MATCHES, NAME_CACHE_TTL_MS, clearNameCacheForTests, nameOrUid } from '../tools/lookups.js';
 import type { FailedJob } from '../tools/jobs.js';
 import { fakeVspc, filterOf, json, page, textOf } from './test-helpers.js';
 
@@ -36,6 +37,14 @@ const ORGS = page([
 const SERVERS = page([{ instanceUid: S1, name: 'VBR-01', organizationUid: C1, status: 'Healthy', displayVersion: '12.3.1' }]);
 
 describe('tool table', () => {
+  it('can be found by "VCSP" (the partner programme) as well as "VSPC" (the console)', () => {
+    expect(SERVER_INSTRUCTIONS).toContain('VCSP (Veeam Cloud Service Provider)');
+    expect(SERVER_INSTRUCTIONS).toContain('Veeam Service Provider Console (VSPC)');
+    const desc = (n: string) => ALL_TOOLS.find((t) => t.name === n)!.description!;
+    expect(desc('vspc_failed_jobs_summary')).toContain('VCSP');
+    expect(desc('vspc_get_license_usage')).toContain('VCSP (Veeam Cloud Service Provider)');
+  });
+
   it('has unique names, strict schemas and the right hints', () => {
     const names = ALL_TOOLS.map((t) => t.name);
     expect(new Set(names).size).toBe(names.length);
@@ -337,6 +346,8 @@ describe('paging and lists', () => {
       setFetchForTests(vspc.fn);
       const out = JSON.parse(textOf(await call('vspc_list_alarms', { hours: 24, limit: 2 })));
       expect(out).toMatchObject({ totalUnfiltered: 7, count: 1, pageCountUnfiltered: 2, offset: 0, timeFilter: 'client' });
+      // ... and why VSPC's own time filter was not used
+      expect(out.timeFilterFallback).toMatchObject({ httpStatus: 400, error: expect.stringContaining('Unsupported filter') });
       // newest first: the page reached an alarm outside the window, so nothing later can be in it
       expect(out.nextOffset).toBeUndefined();
       expect(out.alarms.map((a: { instanceUid: string }) => a.instanceUid)).toEqual([AL1]);
@@ -488,6 +499,122 @@ describe('failed jobs', () => {
     const out = JSON.parse(textOf(await call('vspc_list_failed_jobs', {})));
     expect(out.count).toBe(3);
     expect(out.scanned.vb365.error).toContain('HTTP 403');
+    expect(out.complete).toBe(false);
+    expect(out.warning).toMatch(/^INCOMPLETE: could not read vb365\..*zero does not mean no failures/);
+    expect(out.sourceErrors).toEqual([{ source: 'vb365', httpStatus: 403, error: expect.stringContaining('HTTP 403') }]);
+  });
+
+  it('marks a complete read as complete', async () => {
+    setFetchForTests(fakeVspc(failureRoutes()).fn);
+    const out = JSON.parse(textOf(await call('vspc_list_failed_jobs', {})));
+    expect(out.complete).toBe(true);
+    expect(out.warning).toBeUndefined();
+  });
+
+  // What the first live run hit: the console's name did not resolve, so every request failed.
+  const unreachable = () => {
+    throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND', message: 'getaddrinfo ENOTFOUND vspc.example.local' } });
+  };
+
+  it('is an error, not zero failures, when no source can be read', async () => {
+    setFetchForTests(async () => unreachable());
+    for (const tool of ['vspc_failed_jobs_summary', 'vspc_list_failed_jobs']) {
+      const r = await call(tool, {});
+      expect(r.isError).toBe(true);
+      const text = textOf(r);
+      expect(text).toContain('No job source could be read, so failures are unknown (not zero)');
+      for (const s of ['backup_server:', 'agent:', 'vb365:']) expect(text).toContain(s);
+      expect(text).toContain('ENOTFOUND');
+      expect(text).toContain('in lower case');
+      expect(text).not.toContain('failingJobs');
+    }
+  });
+
+  it('keeps the rate-limit wait when every source is rate limited', async () => {
+    setFetchForTests(async () => json({}, 429, { 'Retry-After': '120' }));
+    const r = await call('vspc_failed_jobs_summary', {});
+    expect(r.isError).toBe(true);
+    expect(r.structuredContent).toEqual({ error: 'rate_limited', retryAfterSeconds: 120 });
+  });
+
+  it('the summary says it is incomplete, and a zero is not a clean zero', async () => {
+    const vspc = fakeVspc(
+      failureRoutes({
+        '/infrastructure/backupServers/jobs': json({ data: null, errors: [{ message: 'Server unavailable' }] }, 500),
+        '/infrastructure/backupAgents/jobs': page([]),
+        '/infrastructure/vb365Servers/organizations/jobs': page([]),
+        '/infrastructure/jobSessionHeatmap/': json({ data: { successJobsCount: 5, warningJobsCount: 0, failJobsCount: 2 } }),
+      })
+    );
+    setFetchForTests(vspc.fn);
+    const out = JSON.parse(textOf(await call('vspc_failed_jobs_summary', {})));
+    expect(out.failingJobs).toBe(0);
+    expect(out.complete).toBe(false);
+    expect(out.warning).toContain('could not read backup_server');
+    expect(out.warning).toContain('zero does not mean no failures');
+    expect(out.sourceErrors[0]).toMatchObject({ source: 'backup_server', error: expect.stringContaining('Server unavailable') });
+    // Output order: the coverage verdict comes before any count
+    expect(Object.keys(out).indexOf('complete')).toBeLessThan(Object.keys(out).indexOf('failingJobs'));
+  });
+
+  it('says when a source was cut short at the cap', async () => {
+    const many = (n: number, from: number) =>
+      Array.from({ length: n }, (_, i) => ({ instanceUid: `j${from + i}`, name: `Job ${from + i}`, status: 'Failed', lastEndTime: ago(1) }));
+    const vspc = fakeVspc({
+      '/infrastructure/backupServers/jobs': (url) => {
+        const offset = Number(url.searchParams.get('offset'));
+        return page(many(500, offset), 3_000, offset);
+      },
+      '/organizations': ORGS,
+      '/infrastructure/backupServers': SERVERS,
+    });
+    setFetchForTests(vspc.fn);
+    const out = JSON.parse(textOf(await call('vspc_list_failed_jobs', { sources: ['backup_server'] })));
+    expect(out.count).toBe(2_000);
+    expect(out.complete).toBe(false);
+    expect(out.partialSources).toEqual(['backup_server']);
+    expect(out.warning).toContain('read only part of backup_server');
+  });
+
+  it('says why the session counts could not be read', async () => {
+    setFetchForTests(fakeVspc(failureRoutes({ '/infrastructure/jobSessionHeatmap/': json({ data: null, errors: [{ message: 'Access denied' }] }, 403) })).fn);
+    const out = JSON.parse(textOf(await call('vspc_failed_jobs_summary', {})));
+    expect(out.sessionCounts).toBeNull();
+    expect(out.sessionCountsError).toMatchObject({ httpStatus: 403, error: expect.stringContaining('(HTTP 403)') });
+    expect(out.sessionCountsError.error).toContain('Access denied');
+    expect(out.sessionCountsError.error).toContain('/infrastructure/jobSessionHeatmap/');
+    expect(out.lookupErrors).toEqual([{ lookup: 'session counts', ...out.sessionCountsError }]);
+    expect(out.complete).toBe(true);
+  });
+
+  it('tells a rate limit and an unreachable console apart from a refusal', async () => {
+    setFetchForTests(fakeVspc(failureRoutes({ '/infrastructure/jobSessionHeatmap/': json({}, 429, { 'Retry-After': '90' }) })).fn);
+    let out = JSON.parse(textOf(await call('vspc_failed_jobs_summary', {})));
+    expect(out.sessionCountsError).toMatchObject({ rateLimited: true, retryAfterSeconds: 90 });
+    expect(out.sessionCountsError.httpStatus).toBeUndefined();
+    const routes = failureRoutes();
+    setFetchForTests(
+      fakeVspc({
+        ...routes,
+        '/infrastructure/jobSessionHeatmap/': () => {
+          throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND', message: 'getaddrinfo ENOTFOUND vspc.example.local' } });
+        },
+      }).fn
+    );
+    out = JSON.parse(textOf(await call('vspc_failed_jobs_summary', {})));
+    expect(out.sessionCountsError.error).toContain('ENOTFOUND');
+    expect(out.sessionCountsError.httpStatus).toBeUndefined();
+    expect(out.sessionCountsError.rateLimited).toBeUndefined();
+  });
+
+  it('never puts the key or a bearer token in an error it returns', async () => {
+    setFetchForTests(
+      fakeVspc(failureRoutes({ '/infrastructure/jobSessionHeatmap/': json({ data: null, errors: [{ message: `bad ${KEY} Bearer abcdefghijklmnop` }] }, 400) })).fn
+    );
+    const text = textOf(await call('vspc_failed_jobs_summary', {}));
+    expect(text).not.toContain(KEY);
+    expect(text).not.toContain('abcdefghijklmnop');
+    expect(JSON.parse(text).sessionCountsError.httpStatus).toBe(400);
   });
 
   it('only asks the given backup server', async () => {
@@ -625,6 +752,65 @@ describe('a job\'s company', () => {
   });
 });
 
+describe('agent names', () => {
+  const now = Date.now();
+  const agentJob = (i: number) => ({
+    instanceUid: `aj${i}`,
+    name: 'Workstations',
+    backupAgentUid: `bbbbbbbb-bbbb-4bbb-8bbb-${String(i).padStart(12, '0')}`,
+    organizationUid: C1,
+    status: 'Failed',
+    lastEndTime: new Date(now - 3_600_000).toISOString(),
+  });
+  const refused = () => json({ data: null, errors: [{ message: 'Access denied' }] }, 403);
+
+  it('reports refused agent-name lookups once, with a count, and shows the UIDs', async () => {
+    const jobs = [agentJob(1), agentJob(2)];
+    const routes: Record<string, unknown> = {
+      '/infrastructure/backupAgents/jobs': page(jobs),
+      '/infrastructure/backupServers/jobs': page([]),
+      '/infrastructure/vb365Servers/organizations/jobs': page([]),
+      '/organizations': ORGS,
+    };
+    for (const j of jobs) routes[`/infrastructure/backupAgents/${j.backupAgentUid}`] = refused;
+    setFetchForTests(fakeVspc(routes as never).fn);
+    const listed = JSON.parse(textOf(await call('vspc_list_agent_jobs')));
+    expect(listed.agentJobs.map((j: { computer: string }) => j.computer)).toEqual(jobs.map((j) => j.backupAgentUid));
+    expect(listed.lookupErrors).toEqual([{ lookup: 'agent names', httpStatus: 403, count: 2, error: expect.stringContaining('Access denied') }]);
+    expect(listed.lookupErrors[0].error).toContain('GET /infrastructure/backupAgents/{uid}');
+    const failed = JSON.parse(textOf(await call('vspc_list_failed_jobs')));
+    expect(failed.lookupErrors).toEqual([{ lookup: 'agent names', httpStatus: 403, count: 2, error: expect.stringContaining('(HTTP 403)') }]);
+  });
+
+  it('says when agents were not looked up because of the cap', async () => {
+    const jobs = Array.from({ length: MAX_AGENT_LOOKUPS + 5 }, (_, i) => agentJob(i));
+    const vspc = fakeVspc({
+      '/infrastructure/backupAgents/jobs': page(jobs),
+      '/organizations': ORGS,
+      ...Object.fromEntries(jobs.map((j) => [`/infrastructure/backupAgents/${j.backupAgentUid}`, json({ data: { name: `PC-${j.instanceUid}` } })])),
+    });
+    setFetchForTests(vspc.fn);
+    const out = JSON.parse(textOf(await call('vspc_list_agent_jobs', { limit: 100 })));
+    expect(vspc.calls.filter((c) => c.path.startsWith('/infrastructure/backupAgents/b'))).toHaveLength(MAX_AGENT_LOOKUPS);
+    expect(out.lookupErrors).toEqual([{ lookup: 'agent names', error: `5 of ${MAX_AGENT_LOOKUPS + 5} agents were not looked up (at most ${MAX_AGENT_LOOKUPS} per call); they show their UID` }]);
+    expect(out.agentJobs.filter((j: { computer: string }) => j.computer.startsWith('PC-'))).toHaveLength(MAX_AGENT_LOOKUPS);
+  });
+
+  it('reports nothing when every agent is named', async () => {
+    const jobs = [agentJob(1)];
+    setFetchForTests(
+      fakeVspc({
+        '/infrastructure/backupAgents/jobs': page(jobs),
+        '/organizations': ORGS,
+        [`/infrastructure/backupAgents/${jobs[0].backupAgentUid}`]: json({ data: { name: 'PC-1' } }),
+      }).fn
+    );
+    const out = JSON.parse(textOf(await call('vspc_list_agent_jobs')));
+    expect(out.agentJobs[0].computer).toBe('PC-1');
+    expect(out.lookupErrors).toBeUndefined();
+  });
+});
+
 describe('names fall back to UIDs', () => {
   const now = Date.now();
   const C3 = '33333333-3333-4333-8333-333333333333'; // not in the organisation list
@@ -665,6 +851,17 @@ describe('names fall back to UIDs', () => {
       const alarms = JSON.parse(textOf(await call('vspc_list_alarms')));
       expect(alarms.alarms[0].company).toBe(C3);
       expect(alarms.alarms[0].alarm).toBe('t1');
+      if (label === 'the lookup fails') {
+        // Why the names are missing is kept, with the status
+        const companyErr = { lookup: 'company names', httpStatus: 500, error: expect.stringContaining('HTTP 500') };
+        expect(failed.lookupErrors).toEqual(expect.arrayContaining([companyErr, { lookup: 'backup server names', httpStatus: 500, error: expect.stringContaining('HTTP 500') }]));
+        expect(summary.lookupErrors).toEqual(expect.arrayContaining([companyErr]));
+        expect(list.lookupErrors).toEqual(expect.arrayContaining([companyErr]));
+        expect(agents.lookupErrors).toEqual([companyErr]);
+        expect(alarms.lookupErrors).toEqual([companyErr]);
+      } else {
+        for (const out of [failed, list, agents, alarms]) expect(out.lookupErrors).toBeUndefined();
+      }
     });
   }
 
@@ -672,6 +869,7 @@ describe('names fall back to UIDs', () => {
     setFetchForTests(fakeVspc({ '/infrastructure/backupServers': page([{ instanceUid: S1, name: 'VBR-01', organizationUid: C3 }]), '/organizations': json({}, 500) }).fn);
     const out = JSON.parse(textOf(await call('vspc_list_backup_servers')));
     expect(out.backupServers[0].company).toBe(C3);
+    expect(out.lookupErrors).toEqual([{ lookup: 'company names', httpStatus: 500, error: expect.stringContaining('HTTP 500') }]);
   });
 
   it('nameOrUid: name, else UID, else nothing', () => {

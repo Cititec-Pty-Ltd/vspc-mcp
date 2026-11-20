@@ -2,8 +2,9 @@ import type { Api, Page } from '../client.js';
 import type { FilterExpression } from '../types.js';
 import { VspcApiError } from '../types.js';
 import { JOB_SOURCES, RESULT_STATUSES, companyFilter, findFailedJobs, groupFailures, jobBelongsTo, jobCompanyFilter, jobCompanyUid, statusFilter } from './jobs.js';
-import type { JobSource } from './jobs.js';
-import { Names, nameOrUid, resolveCompany, safely } from './lookups.js';
+import type { FailedJobsResult, JobSource } from './jobs.js';
+import { LookupLog, Names, agentNames, errorInfo, nameOrUid, resolveCompany } from './lookups.js';
+import type { ErrorInfo } from './lookups.js';
 import type { ParamSpec, ReadSpec } from './spec.js';
 import { hoursAgo, oneLine, pick, timeOf } from './shared.js';
 
@@ -52,6 +53,32 @@ type UsageField = (typeof USAGE_FIELDS)[number];
 /** Most jobs read for one company in vspc_list_jobs (it pages them here; see there). */
 const MAX_COMPANY_JOBS = 5_000;
 
+/**
+ * What a failure result covers, put first in the output. When a source could
+ * not be read (or was cut short), `complete` is false and `warning` says the
+ * counts are a lower bound, so a zero is never read as "no failures".
+ */
+function coverage(r: FailedJobsResult): Record<string, unknown> {
+  if (r.complete) return { complete: true };
+  const missing = r.sourceErrors.map((e) => e.source);
+  const parts = [
+    missing.length ? `could not read ${missing.join(', ')}` : '',
+    r.partialSources.length ? `read only part of ${r.partialSources.join(', ')}` : '',
+  ].filter(Boolean);
+  return {
+    complete: false,
+    warning: `INCOMPLETE: ${parts.join('; ')}. The counts below cover only what was read: they are a lower bound, and zero does not mean no failures.`,
+    ...(r.sourceErrors.length ? { sourceErrors: r.sourceErrors } : {}),
+    ...(r.partialSources.length ? { partialSources: r.partialSources } : {}),
+  };
+}
+
+/** The failure path's lookup errors, plus any of this tool's own. */
+function lookupErrorsOf(r: FailedJobsResult, log?: LookupLog): Record<string, unknown> {
+  const all = [...(r.lookupErrors ?? []), ...(log?.report().lookupErrors ?? [])];
+  return all.length ? { lookupErrors: all } : {};
+}
+
 /** Rows in vspc_failed_jobs_summary (Failed rows sort first; byCompany always counts every row). */
 const MAX_SUMMARY_ROWS = 120;
 
@@ -90,8 +117,10 @@ export const READ_SPECS: ReadSpec[] = [
         limit: args.limit as number,
         offset: args.offset as number,
       });
-      const resellers = await safely(new Names(api).organizations());
+      const log = new LookupLog();
+      const resellers = await log.safely('reseller names', new Names(api).organizations());
       return {
+        ...log.report(),
         ...paging(p),
         companies: p.items.map((c) => ({
           ...pick(c, ['instanceUid', 'name', 'status']),
@@ -136,8 +165,10 @@ export const READ_SPECS: ReadSpec[] = [
         offset: args.offset as number,
       });
       const names = new Names(api);
-      const orgs = await safely(names.organizations());
+      const log = new LookupLog();
+      const orgs = await log.safely('company names', names.organizations());
       return {
+        ...log.report(),
         ...paging(p),
         backupServers: p.items.map((s) => ({
           ...pick(s, ['instanceUid', 'name']),
@@ -186,8 +217,10 @@ export const READ_SPECS: ReadSpec[] = [
         p = await api.page(path, { filter, sort, limit, offset });
       }
       const names = new Names(api);
-      const [orgs, servers] = await Promise.all([safely(names.organizations()), safely(names.backupServers())]);
+      const log = new LookupLog();
+      const [orgs, servers] = await Promise.all([log.safely('company names', names.organizations()), log.safely('backup server names', names.backupServers())]);
       return {
+        ...log.report(),
         ...paging(p),
         ...(complete
           ? {}
@@ -230,11 +263,11 @@ export const READ_SPECS: ReadSpec[] = [
         offset: args.offset as number,
       });
       const names = new Names(api);
-      const orgs = await safely(names.organizations());
-      const agentUids = [...new Set(p.items.map((j) => String(j.backupAgentUid ?? '').toLowerCase()).filter(Boolean))].slice(0, 40);
-      const computers = new Map<string, string | undefined>();
-      await Promise.all(agentUids.map(async (u) => computers.set(u, await names.agentName(u))));
+      const log = new LookupLog();
+      const orgs = await log.safely('company names', names.organizations());
+      const computers = await agentNames(names, p.items.map((j) => String(j.backupAgentUid ?? '')), log);
       return {
+        ...log.report(),
         ...paging(p),
         agentJobs: p.items.map((j) => ({
           ...pick(j, ['instanceUid', 'name']),
@@ -272,13 +305,15 @@ export const READ_SPECS: ReadSpec[] = [
         backupServerUid: args.backup_server_uid as string | undefined,
       });
       return {
+        ...coverage(r),
         window: r.window,
         statuses: r.statuses,
+        ...lookupErrorsOf(r),
         count: r.jobs.length,
         ...(r.jobs.length > (args.max_rows as number) ? { shown: args.max_rows, more: 'Narrow by company, sources or hours, or use vspc_failed_jobs_summary.' } : {}),
         jobs: r.jobs.slice(0, args.max_rows as number),
         scanned: r.scanned,
-        note: 'Latest session per job only (VSPC keeps no session history). Incomplete sources are marked complete: false.',
+        note: 'Latest session per job only (VSPC keeps no session history).',
       };
     },
   },
@@ -286,7 +321,7 @@ export const READ_SPECS: ReadSpec[] = [
     name: 'vspc_failed_jobs_summary',
     kind: 'read',
     description:
-      'Summary of backup failures across ALL companies in the last N hours: one row per job (retries of the same job, and one agent job failing on several computers of a company, are folded together, worst result first), counts per company, and VSPC\'s session counts (successful, warning, failed sessions) for the window. The best first call for "which backups failed in the last 24 hours?".',
+      'Summary of backup failures across ALL companies (VCSP / Veeam Cloud Service Provider clients) in the last N hours: one row per job (retries of the same job, and one agent job failing on several computers of a company, are folded together, worst result first), counts per company, and VSPC\'s session counts (successful, warning, failed sessions) for the window. The best first call for "which backups failed in the last 24 hours?".',
     params: {
       hours: { type: 'int', min: 1, max: 720, default: 24, description: 'Look-back window in hours (default 24).' },
       include_warnings: { type: 'boolean', default: false, description: 'Also include jobs whose latest session ended with a warning.' },
@@ -297,11 +332,12 @@ export const READ_SPECS: ReadSpec[] = [
       const now = Date.now();
       const hours = args.hours as number;
       const statuses = args.include_warnings ? ['Failed', 'Warning'] : ['Failed'];
+      const log = new LookupLog();
       const [r, heat] = await Promise.all([
         findFailedJobs(api, { hours, statuses, sources: [...JOB_SOURCES], companyUid: company?.uid, now }),
         company
           ? Promise.resolve(undefined)
-          : safely(api.get<Record<string, unknown>>('/infrastructure/jobSessionHeatmap/', { from: hoursAgo(hours, now), to: new Date(now).toISOString() })),
+          : log.safely('session counts', api.get<Record<string, unknown>>('/infrastructure/jobSessionHeatmap/', { from: hoursAgo(hours, now), to: new Date(now).toISOString() })),
       ]);
       const groups = groupFailures(r.jobs);
       const perCompany = new Map<string, { failed: number; warning: number }>();
@@ -313,8 +349,14 @@ export const READ_SPECS: ReadSpec[] = [
         perCompany.set(k, c);
       }
       return {
+        ...coverage(r),
         window: r.window,
-        ...(heat ? { sessionCounts: pick(heat, ['successJobsCount', 'warningJobsCount', 'failJobsCount']) } : {}),
+        ...(heat
+          ? { sessionCounts: pick(heat, ['successJobsCount', 'warningJobsCount', 'failJobsCount']) }
+          : company
+            ? {}
+            : { sessionCounts: null, sessionCountsError: log.errorFor('session counts') ?? { error: 'VSPC returned no session counts for this window.' } }),
+        ...lookupErrorsOf(r, log),
         failingJobs: groups.length,
         byCompany: [...perCompany.entries()]
           .map(([name, c]) => ({ company: name, ...c }))
@@ -353,6 +395,7 @@ export const READ_SPECS: ReadSpec[] = [
       // The time window goes to VSPC, so total, count and nextOffset are exact. If the console
       // refuses a date comparison (HTTP 400), filter here instead and say so (see the paging below).
       let timeFilter: 'vspc' | 'client' | undefined = since === undefined ? undefined : 'vspc';
+      let timeFilterFallback: ErrorInfo | undefined;
       let p;
       try {
         p = await query(
@@ -363,12 +406,14 @@ export const READ_SPECS: ReadSpec[] = [
       } catch (err) {
         if (!(since !== undefined && err instanceof VspcApiError && err.httpStatus === 400)) throw err;
         timeFilter = 'client';
+        timeFilterFallback = errorInfo(err);
         p = await query(filter);
       }
       const names = new Names(api);
+      const log = new LookupLog();
       const [orgs, templates] = await Promise.all([
-        safely(names.organizations()),
-        safely(api.all<Record<string, unknown>>('/alarms/templates', {}, { maxItems: 5_000 })),
+        log.safely('company names', names.organizations()),
+        log.safely('alarm names', api.all<Record<string, unknown>>('/alarms/templates', {}, { maxItems: 5_000 })),
       ]);
       const templateName = new Map((templates?.items ?? []).map((t) => [String(t.instanceUid ?? '').toLowerCase(), String(t.name ?? '')]));
       const inWindow = (a: Record<string, unknown>) =>
@@ -392,7 +437,7 @@ export const READ_SPECS: ReadSpec[] = [
           };
         });
       if (timeFilter !== 'client' && alarms.length === p.items.length) {
-        return { ...paging(p), ...(timeFilter ? { timeFilter } : {}), alarms };
+        return { ...log.report(), ...paging(p), ...(timeFilter ? { timeFilter } : {}), alarms };
       }
       // Filtered here: `count` is what this page shows, `pageCountUnfiltered` what VSPC returned.
       // Alarms come newest first, so once this page reaches one outside the window there is
@@ -400,12 +445,14 @@ export const READ_SPECS: ReadSpec[] = [
       const nextRaw = p.offset + p.count;
       const reachedWindowEnd = p.items.some((a) => !inWindow(a));
       return {
+        ...log.report(),
         totalUnfiltered: p.total,
         count: alarms.length,
         pageCountUnfiltered: p.count,
         offset: p.offset,
         ...(!reachedWindowEnd && nextRaw < p.total ? { nextOffset: nextRaw } : {}),
         timeFilter: 'client',
+        ...(timeFilterFallback ? { timeFilterFallback } : {}),
         note: reachedWindowEnd
           ? 'Time filter applied after fetching; this page reached alarms older than the window, so there are no more in it.'
           : 'Time filter applied after fetching; a page can show fewer alarms than limit. Follow nextOffset for more.',
@@ -436,8 +483,10 @@ export const READ_SPECS: ReadSpec[] = [
         offset: args.offset as number,
       });
       const names = new Names(api);
-      const [orgs, servers] = await Promise.all([safely(names.organizations()), safely(names.backupServers())]);
+      const log = new LookupLog();
+      const [orgs, servers] = await Promise.all([log.safely('company names', names.organizations()), log.safely('backup server names', names.backupServers())]);
       return {
+        ...log.report(),
         ...paging(p),
         vms: p.items.map((v) => ({
           ...pick(v, ['instanceUid', 'name']),
@@ -475,7 +524,7 @@ export const READ_SPECS: ReadSpec[] = [
     name: 'vspc_get_license_usage',
     kind: 'read',
     description:
-      'Current license usage by organization and server (Veeam Backup & Replication, Cloud Connect, VB365, VSPC, Veeam ONE): per workload type the used, new and rental units and counts, plus totals per workload across the result. Optionally one company.',
+      'VCSP (Veeam Cloud Service Provider) licence usage, as reported to Veeam under the VCSP programme: current license usage by organization and server (Veeam Backup & Replication, Cloud Connect, VB365, VSPC, Veeam ONE): per workload type the used, new and rental units and counts, plus totals per workload across the result. Optionally one company.',
     params: {
       company: COMPANY,
       server_type: { type: 'string', enum: ['BackupAndReplication', 'CloudConnect', 'VSPC', 'VONE', 'VB365'], description: 'Only usage on servers of this product.' },
@@ -490,7 +539,8 @@ export const READ_SPECS: ReadSpec[] = [
         offset: args.offset as number,
       });
       const names = new Names(api);
-      const [orgs, servers] = await Promise.all([safely(names.organizations()), safely(names.backupServers())]);
+      const log = new LookupLog();
+      const [orgs, servers] = await Promise.all([log.safely('company names', names.organizations()), log.safely('backup server names', names.backupServers())]);
       // Every unit and count field of CurrentLicenseUsageWorkload (and ...ByPlatform) in the 3.6.1 spec.
       const nonZero = (w: Record<string, unknown>) => USAGE_FIELDS.some((f) => Number(w[f] ?? 0) !== 0);
       const totals = new Map<string, { workload: string; unitType?: unknown } & Record<UsageField, number>>();
@@ -521,6 +571,7 @@ export const READ_SPECS: ReadSpec[] = [
         })),
       }));
       return {
+        ...log.report(),
         ...paging(p),
         totals: [...totals.values()],
         organizations,

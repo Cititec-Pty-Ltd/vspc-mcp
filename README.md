@@ -2,6 +2,8 @@
 
 An MCP server for the [Veeam Service Provider Console](https://www.veeam.com/service-provider-console.html) (VSPC) REST API v3. VSPC sees every client's Veeam Backup & Replication servers, Veeam Agents and Veeam Backup for Microsoft 365 servers, so Claude can answer questions across all clients in one call, for example "which backups failed in the last 24 hours?". Separately named write tools can start or retry a job and acknowledge or resolve an alarm.
 
+**VCSP vs VSPC.** VCSP (Veeam Cloud Service Provider) is Veeam's partner programme. VSPC is the console a VCSP partner uses to manage its clients' Veeam, and it is what these tools read. Questions about either belong here. In particular, `vspc_get_license_usage` gives the licence usage (points and instances) that is reported to Veeam under the VCSP programme.
+
 It uses the same framework as Cititec's other MCP servers: TypeScript, `@modelcontextprotocol/sdk`, a stdio transport, vitest tests, tsup and a Docker image.
 
 ## The API
@@ -47,7 +49,12 @@ Job sources in the failure tools:
 - `agent`: Veeam Agents managed by VSPC.
 - `vb365`: Veeam Backup for Microsoft 365 jobs.
 
-If one source fails (for example, the key's user cannot see VB365), the others are still returned. The failed source is reported under `scanned`.
+A failure count is never shown as a clean zero when data is missing:
+
+- If no source can be read (for example, the console is unreachable), the tool returns an error giving each source's reason. A rate-limit wait is kept, as `rate_limited`.
+- If some sources fail, or one is cut short at its cap, the result starts with `complete: false` and a `warning`: the counts are a lower bound, and zero does not mean no failures. The result lists `sourceErrors` and `partialSources`.
+- If VSPC's session counts cannot be read, the summary returns `sessionCounts: null` and gives the reason.
+- A name lookup or count that failed is listed in `lookupErrors`, so a refused request (403) is not mistaken for a passing glitch. It gives what was being looked up, the error text (method and path only, never the key or query string), the HTTP status, and for a 429 `rateLimited` and `retryAfterSeconds`. Rows still show UIDs where the names are missing. `sourceErrors` use the same form. The same failure on many items, such as one agent-name GET per agent refused with 403, is listed once with a `count`. Agents beyond the 40 named per call are listed too: they show their UID. When the alarm time filter falls back, `timeFilterFallback` gives the reason.
 
 ### Write tools
 

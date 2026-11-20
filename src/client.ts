@@ -21,6 +21,8 @@ export const VSPC_API_VERSION = '3.6.1';
 
 const KEY_HINT =
   ' Check VSPC_API_KEY: a Simple REST API key (Configuration > Access Management > REST API Keys, scope rest) whose user is enabled.';
+const DNS_HINT =
+  ' The host name in VSPC_URL does not resolve. If it is pinned in /etc/hosts or a container extra_hosts entry, write it there in lower case: Node looks the name up in lower case and that lookup can be case-sensitive.';
 const TLS_HINT =
   ' If the console uses a self-signed certificate or one issued for another name, set VSPC_ACCEPT_SELF_SIGNED=true.';
 
@@ -114,7 +116,8 @@ function describeNetworkError(err: unknown, config: VspcConfig): string {
   const code = e.cause?.code ?? '';
   const detail = scrub(`${e.cause?.message ?? e.message}`, config).slice(0, 200);
   const tls = /CERT|SELF_SIGNED|ALTNAME|UNABLE_TO_VERIFY|TLS|SSL/i.test(`${code} ${detail}`);
-  return `failed (${code || e.name}: ${detail}).${tls ? TLS_HINT : ''}`;
+  const dns = /ENOTFOUND|EAI_AGAIN/.test(code);
+  return `failed (${code || e.name}: ${detail}).${tls ? TLS_HINT : ''}${dns ? DNS_HINT : ''}`;
 }
 
 function errorDetail(body: string, config: VspcConfig): { message: string; code?: number } {

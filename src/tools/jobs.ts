@@ -1,6 +1,8 @@
 import type { Api } from '../client.js';
 import type { FilterExpression } from '../types.js';
-import { Names, nameOrUid, safely } from './lookups.js';
+import { VspcApiError, VspcAuthError, VspcRateLimitError } from '../types.js';
+import { LookupLog, Names, agentNames, errorInfo, nameOrUid } from './lookups.js';
+import type { ErrorInfo } from './lookups.js';
 import { oneLine, timeOf } from './shared.js';
 
 /**
@@ -105,6 +107,32 @@ export interface FailedJobsResult {
   jobs: FailedJob[];
   /** Per source: matching latest-session jobs before the time filter, and whether every page was read. */
   scanned: Record<string, { matched: number; read: number; complete: boolean; error?: string }>;
+  /**
+   * True only if every source asked for was read in full. When false, `jobs`
+   * is a lower bound: a zero means "none found in what could be read", never
+   * "no failures".
+   */
+  complete: boolean;
+  /** Sources that could not be read, and why. */
+  sourceErrors: ({ source: JobSource } & ErrorInfo)[];
+  /** Sources read only in part (the page or time cap was hit). */
+  partialSources: JobSource[];
+  /** Name lookups that failed (rows then show UIDs), with the reason. */
+  lookupErrors: ReturnType<LookupLog['report']>['lookupErrors'];
+}
+
+/**
+ * Thrown when no job source could be read: a tool must report that as an
+ * error, not as an empty result. Keeps a rate-limit wait if any source had one.
+ */
+function allSourcesFailed(failures: { source: JobSource; err: unknown }[]): Error {
+  const reasons = failures.map((f) => `${f.source}: ${(f.err as Error).message}`).join('; ');
+  const message = `No job source could be read, so failures are unknown (not zero). ${reasons}`;
+  const limited = failures.map((f) => f.err).find((e): e is VspcRateLimitError => e instanceof VspcRateLimitError);
+  if (limited) return new VspcRateLimitError(message, limited.retryAfterSeconds);
+  const auth = failures.map((f) => f.err).find((e): e is VspcAuthError => e instanceof VspcAuthError);
+  if (auth) return new VspcAuthError(message, auth.httpStatus);
+  return new VspcApiError(message);
 }
 
 export interface FailedJobsQuery {
@@ -116,8 +144,6 @@ export interface FailedJobsQuery {
   now?: number;
 }
 
-/** Most agent lookups per call (one GET each); past this, agent rows show the agent UID. */
-const MAX_AGENT_LOOKUPS = 40;
 
 function vb365Message(j: Record<string, unknown>): string | undefined {
   const logs = Array.isArray(j.lastErrorLogRecords) ? (j.lastErrorLogRecords as Record<string, unknown>[]) : [];
@@ -130,7 +156,9 @@ export async function findFailedJobs(api: Api, q: FailedJobsQuery): Promise<Fail
   const since = now - q.hours * 3_600_000;
   const deadline = now + 40_000;
   const names = new Names(api);
+  const log = new LookupLog();
   const scanned: FailedJobsResult['scanned'] = {};
+  const failures: { source: JobSource; err: unknown }[] = [];
   const jobs: FailedJob[] = [];
   // With a backup server given, only that server's jobs can match.
   const sources = q.backupServerUid ? (['backup_server'] as JobSource[]) : q.sources;
@@ -151,6 +179,7 @@ export async function findFailedJobs(api: Api, q: FailedJobsQuery): Promise<Fail
       } catch (err) {
         // One source failing (e.g. no VB365 servers, or the key's user cannot see agents) must not hide the others.
         scanned[source] = { matched: 0, read: 0, complete: false, error: (err as Error).message };
+        failures.push({ source, err });
         return;
       }
       for (const j of got.items) {
@@ -185,20 +214,20 @@ export async function findFailedJobs(api: Api, q: FailedJobsQuery): Promise<Fail
       scanned[source] = { matched: got.total, read: got.items.length, complete: got.complete };
     })
   );
+  if (failures.length === sources.length) throw allSourcesFailed(failures);
 
   // Names, best effort.
-  const orgs = await safely(names.organizations());
-  const servers = jobs.some((j) => j.source === 'backup_server') ? await safely(names.backupServers()) : undefined;
-  const agentUids = [...new Set(jobs.filter((j) => j.source === 'agent' && j.whereUid).map((j) => String(j.whereUid).toLowerCase()))].slice(
-    0,
-    MAX_AGENT_LOOKUPS
+  const orgs = await log.safely('company names', names.organizations());
+  const servers = jobs.some((j) => j.source === 'backup_server') ? await log.safely('backup server names', names.backupServers()) : undefined;
+  const agents = await agentNames(
+    names,
+    jobs.filter((j) => j.source === 'agent' && j.whereUid).map((j) => String(j.whereUid)),
+    log
   );
-  const agentNames = new Map<string, string | undefined>();
-  await Promise.all(agentUids.map(async (u) => agentNames.set(u, await names.agentName(u))));
   for (const j of jobs) {
     j.company = nameOrUid(orgs, j.companyUid);
     if (j.source === 'backup_server') j.where = nameOrUid(servers, j.whereUid);
-    else if (j.source === 'agent') j.where = nameOrUid(agentNames, j.whereUid);
+    else if (j.source === 'agent') j.where = nameOrUid(agents, j.whereUid);
     else j.where = j.where || nameOrUid(undefined, j.whereUid);
   }
 
@@ -208,6 +237,10 @@ export async function findFailedJobs(api: Api, q: FailedJobsQuery): Promise<Fail
     statuses: q.statuses,
     jobs,
     scanned,
+    complete: sources.every((s) => scanned[s]?.complete === true),
+    sourceErrors: failures.map((f) => ({ source: f.source, ...errorInfo(f.err) })),
+    partialSources: sources.filter((s) => scanned[s] && !scanned[s].error && !scanned[s].complete),
+    lookupErrors: log.report().lookupErrors,
   };
 }
 
