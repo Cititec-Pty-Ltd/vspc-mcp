@@ -45,6 +45,10 @@ const JOB_FIELDS = [
   'destination', 'targetType', 'retentionLimit', 'retentionLimitType', 'bottleneck',
 ] as const;
 
+/** License usage figures per workload (CurrentLicenseUsageWorkload, REST API 3.6.1). */
+const USAGE_FIELDS = ['usedUnits', 'newUnits', 'rentalUnits', 'usedCount', 'newCount', 'rentalCount'] as const;
+type UsageField = (typeof USAGE_FIELDS)[number];
+
 /** Rows in vspc_failed_jobs_summary (Failed rows sort first; byCompany always counts every row). */
 const MAX_SUMMARY_ROWS = 120;
 
@@ -468,30 +472,38 @@ export const READ_SPECS: ReadSpec[] = [
       });
       const names = new Names(api);
       const [orgs, servers] = await Promise.all([safely(names.organizations()), safely(names.backupServers())]);
-      const totals = new Map<string, { unitType?: unknown; usedUnits: number; usedCount: number; newCount: number; rentalCount: number }>();
+      // Every unit and count field of CurrentLicenseUsageWorkload (and ...ByPlatform) in the 3.6.1 spec.
+      const nonZero = (w: Record<string, unknown>) => USAGE_FIELDS.some((f) => Number(w[f] ?? 0) !== 0);
+      const totals = new Map<string, { workload: string; unitType?: unknown } & Record<UsageField, number>>();
       const organizations = p.items.map((o) => ({
         organization: orgs?.get(String(o.organizationUid ?? '').toLowerCase()) ?? o.organizationUid,
         organizationType: o.organizationType,
         servers: (Array.isArray(o.servers) ? (o.servers as Record<string, unknown>[]) : []).map((s) => ({
           server: servers?.get(String(s.serverUid ?? '').toLowerCase()) ?? s.serverUid,
           serverType: s.serverType,
-          workloads: (Array.isArray(s.workloads) ? (s.workloads as Record<string, unknown>[]) : [])
-            .filter((w) => Number(w.usedCount ?? 0) || Number(w.usedUnits ?? 0) || Number(w.rentalCount ?? 0) || Number(w.newCount ?? 0))
-            .map((w) => {
-              const key = String(w.description ?? w.id ?? 'workload');
-              const t = totals.get(key) ?? { unitType: w.unitType, usedUnits: 0, usedCount: 0, newCount: 0, rentalCount: 0 };
-              t.usedUnits += Number(w.usedUnits ?? 0);
-              t.usedCount += Number(w.usedCount ?? 0);
-              t.newCount += Number(w.newCount ?? 0);
-              t.rentalCount += Number(w.rentalCount ?? 0);
-              totals.set(key, t);
-              return pick(w, ['description', 'unitType', 'usedUnits', 'usedCount', 'newUnits', 'newCount', 'rentalUnits', 'rentalCount']);
-            }),
+          workloads: (Array.isArray(s.workloads) ? (s.workloads as Record<string, unknown>[]) : []).filter(nonZero).map((w) => {
+            const workload = String(w.description ?? w.id ?? 'workload');
+            // Units of different kinds (instances vs points) are never added together.
+            const key = `${workload}|${String(w.unitType ?? '')}`;
+            const t =
+              totals.get(key) ??
+              ({ workload, unitType: w.unitType, ...Object.fromEntries(USAGE_FIELDS.map((f) => [f, 0])) } as {
+                workload: string;
+                unitType?: unknown;
+              } & Record<UsageField, number>);
+            for (const f of USAGE_FIELDS) t[f] += Number(w[f] ?? 0);
+            totals.set(key, t);
+            // The platform breakdown splits the same units: shown, never added to the totals again.
+            const platforms = (Array.isArray(w.workloadsByPlatform) ? (w.workloadsByPlatform as Record<string, unknown>[]) : [])
+              .filter(nonZero)
+              .map((x) => pick(x, ['description', 'weight', ...USAGE_FIELDS]));
+            return { ...pick(w, ['description', 'unitType', ...USAGE_FIELDS]), ...(platforms.length ? { byPlatform: platforms } : {}) };
+          }),
         })),
       }));
       return {
         ...paging(p),
-        totals: [...totals.entries()].map(([workload, t]) => ({ workload, ...t })),
+        totals: [...totals.values()],
         organizations,
       };
     },

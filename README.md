@@ -38,7 +38,7 @@ Read tools only send GET requests. Results are trimmed to the useful fields. Com
 | `vspc_list_alarms` | `GET /alarms/active` (Error and Warning by default, newest first), with alarm names from `GET /alarms/templates`. `hours` is sent to VSPC as a `lastActivation.time` filter, so paging is exact. If the console refuses that filter, the window is applied here instead: `timeFilter: "client"` with `count`, `pageCountUnfiltered`, and no `nextOffset` once the page reaches older alarms |
 | `vspc_list_protected_vms` | `GET /protectedWorkloads/virtualMachines` (`oldest_first` finds stale backups) |
 | `vspc_list_backup_policies` | `GET /configuration/backupPolicies` |
-| `vspc_get_license_usage` | `GET /licensing/usage/organizations`, with totals per workload |
+| `vspc_get_license_usage` | `GET /licensing/usage/organizations`: used, new and rental units and counts per workload (with the per-platform split), and totals per workload and unit type |
 | `vspc_get_console_license` | `GET /licensing/console` |
 
 Job sources in the failure tools:

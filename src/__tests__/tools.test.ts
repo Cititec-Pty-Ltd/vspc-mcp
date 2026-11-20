@@ -373,8 +373,64 @@ describe('paging and lists', () => {
     });
     setFetchForTests(vspc.fn);
     const out = JSON.parse(textOf(await call('vspc_get_license_usage')));
-    expect(out.totals).toEqual([{ workload: 'VMs', unitType: 'Instances', usedUnits: 7, usedCount: 7, newCount: 0, rentalCount: 0 }]);
+    expect(out.totals).toEqual([
+      { workload: 'VMs', unitType: 'Instances', usedUnits: 7, newUnits: 0, rentalUnits: 0, usedCount: 7, newCount: 0, rentalCount: 0 },
+    ]);
     expect(out.organizations[0].servers[0]).toMatchObject({ server: 'VBR-01', workloads: [{ description: 'VMs' }] });
+    expect(out.organizations[0].servers[0].workloads).toHaveLength(1);
+  });
+
+  it('keeps and totals new and rental units, per unit type, without double-counting platforms', async () => {
+    const vspc = fakeVspc({
+      '/licensing/usage/organizations': page([
+        {
+          organizationUid: C1,
+          servers: [
+            {
+              serverUid: S1,
+              serverType: 'CloudConnect',
+              workloads: [
+                // Only new units: must be kept and totalled
+                { description: 'Cloud backups', unitType: 'Points', newUnits: 2.5, newCount: 1 },
+                // Only rental units
+                { description: 'Cloud backups', unitType: 'Points', rentalUnits: 4, rentalCount: 2 },
+                // Same name, other unit type: a separate total
+                { description: 'Cloud backups', unitType: 'Instances', usedUnits: 3, usedCount: 3 },
+                {
+                  description: 'Servers',
+                  unitType: 'Instances',
+                  usedUnits: 5,
+                  usedCount: 5,
+                  workloadsByPlatform: [
+                    { description: 'VMware', weight: 1, usedUnits: 3, usedCount: 3 },
+                    { description: 'Hyper-V', weight: 1, usedUnits: 2, usedCount: 2 },
+                    { description: 'Nutanix', weight: 1 },
+                  ],
+                },
+                { description: 'Nothing', unitType: 'Instances', usedUnits: 0, newUnits: 0, rentalUnits: 0 },
+              ],
+            },
+          ],
+        },
+      ]),
+      '/organizations': ORGS,
+      '/infrastructure/backupServers': SERVERS,
+    });
+    setFetchForTests(vspc.fn);
+    const out = JSON.parse(textOf(await call('vspc_get_license_usage')));
+    const zero = { usedUnits: 0, newUnits: 0, rentalUnits: 0, usedCount: 0, newCount: 0, rentalCount: 0 };
+    expect(out.totals).toEqual([
+      { workload: 'Cloud backups', unitType: 'Points', ...zero, newUnits: 2.5, rentalUnits: 4, newCount: 1, rentalCount: 2 },
+      { workload: 'Cloud backups', unitType: 'Instances', ...zero, usedUnits: 3, usedCount: 3 },
+      { workload: 'Servers', unitType: 'Instances', ...zero, usedUnits: 5, usedCount: 5 },
+    ]);
+    const w = out.organizations[0].servers[0].workloads;
+    expect(w.map((x: { description: string }) => x.description)).toEqual(['Cloud backups', 'Cloud backups', 'Cloud backups', 'Servers']);
+    expect(w[0]).toEqual({ description: 'Cloud backups', unitType: 'Points', newUnits: 2.5, newCount: 1 });
+    expect(w[3].byPlatform).toEqual([
+      { description: 'VMware', weight: 1, usedUnits: 3, usedCount: 3 },
+      { description: 'Hyper-V', weight: 1, usedUnits: 2, usedCount: 2 },
+    ]);
   });
 });
 
