@@ -1,7 +1,7 @@
 import type { Api } from '../client.js';
 import type { FilterExpression } from '../types.js';
 import { VspcApiError } from '../types.js';
-import { JOB_SOURCES, RESULT_STATUSES, companyFilter, findFailedJobs, groupFailures, statusFilter } from './jobs.js';
+import { JOB_SOURCES, RESULT_STATUSES, companyFilter, findFailedJobs, groupFailures, jobCompanyFilter, jobCompanyUid, statusFilter } from './jobs.js';
 import type { JobSource } from './jobs.js';
 import { Names, resolveCompany, safely } from './lookups.js';
 import type { ParamSpec, ReadSpec } from './spec.js';
@@ -161,7 +161,7 @@ export const READ_SPECS: ReadSpec[] = [
     run: async (args, api) => {
       const company = await companyOf(api, args);
       const filter = nameFilter(args.name);
-      if (company) filter.push(companyFilter(['organizationUid', 'mappedOrganizationUid'], company.uid));
+      if (company) filter.push(jobCompanyFilter('backup_server', company.uid));
       if (args.statuses) filter.push(statusFilter('status', args.statuses as string[]));
       if (typeof args.enabled === 'boolean') filter.push({ property: 'isEnabled', operation: 'equals', value: args.enabled });
       const path = args.backup_server_uid ? `/infrastructure/backupServers/${args.backup_server_uid}/jobs` : '/infrastructure/backupServers/jobs';
@@ -176,10 +176,10 @@ export const READ_SPECS: ReadSpec[] = [
       return {
         ...paging(p),
         jobs: p.items.map((j) => {
-          const owner = String(j.mappedOrganizationUid ?? j.organizationUid ?? '').toLowerCase();
+          const owner = jobCompanyUid('backup_server', j);
           return {
             ...pick(j, ['instanceUid', 'name']),
-            company: orgs?.get(owner) ?? (owner || undefined),
+            company: (owner && orgs?.get(owner)) ?? owner,
             backupServer: servers?.get(String(j.backupServerUid ?? '').toLowerCase()) ?? j.backupServerUid,
             ...pick(j, JOB_FIELDS),
             ...(oneLine(j.failureMessage, 400) ? { failureMessage: oneLine(j.failureMessage, 400) } : {}),
@@ -203,7 +203,7 @@ export const READ_SPECS: ReadSpec[] = [
     run: async (args, api) => {
       const company = await companyOf(api, args);
       const filter = nameFilter(args.name);
-      if (company) filter.push(companyFilter(['organizationUid'], company.uid));
+      if (company) filter.push(jobCompanyFilter('agent', company.uid));
       if (args.statuses) filter.push(statusFilter('status', args.statuses as string[]));
       const p = await api.page('/infrastructure/backupAgents/jobs', {
         filter,
@@ -221,7 +221,7 @@ export const READ_SPECS: ReadSpec[] = [
         agentJobs: p.items.map((j) => ({
           ...pick(j, ['instanceUid', 'name']),
           computer: computers.get(String(j.backupAgentUid ?? '')) ?? j.backupAgentUid,
-          company: orgs?.get(String(j.organizationUid ?? '').toLowerCase()) ?? j.organizationUid,
+          company: ((uid) => (uid && orgs?.get(uid)) ?? uid)(jobCompanyUid('agent', j)),
           ...pick(j, ['systemType', 'backupPolicyName', 'backupPolicyAssignStatus', 'status', 'lastRun', 'lastEndTime', 'lastDuration', 'nextRun', 'backupMode', 'targetType', 'destination', 'isEnabled']),
           ...(oneLine(j.failureMessage ?? j.backupPolicyFailureMessage, 400)
             ? { failureMessage: oneLine(j.failureMessage ?? j.backupPolicyFailureMessage, 400) }

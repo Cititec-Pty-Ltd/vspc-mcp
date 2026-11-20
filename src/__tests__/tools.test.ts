@@ -247,7 +247,7 @@ describe('paging and lists', () => {
       ]),
       '/infrastructure/backupServers/jobs': (url) => {
         expect(filterOf(url)).toEqual([
-          { operation: 'or', items: [{ property: 'organizationUid', operation: 'equals', value: C1 }, { property: 'mappedOrganizationUid', operation: 'equals', value: C1 }] },
+          { operation: 'or', items: [{ property: 'mappedOrganizationUid', operation: 'equals', value: C1 }, { property: 'organizationUid', operation: 'equals', value: C1 }] },
           { operation: 'or', items: [{ property: 'status', operation: 'equals', value: 'Failed' }, { property: 'status', operation: 'equals', value: 'Warning' }] },
         ]);
         return page([{ instanceUid: J1, name: 'Nightly', backupServerUid: S1, organizationUid: C1, status: 'Failed', failureMessage: 'Error: disk\r\nfull' }]);
@@ -537,6 +537,47 @@ describe('failed jobs', () => {
       { company: 'Client One', failed: 2, warning: 0 },
       { company: 'Client Two', failed: 1, warning: 0 },
     ]);
+  });
+});
+
+describe('a job\'s company', () => {
+  const now = Date.now();
+  // Job on a hosted backup server: the server belongs to C2 (the provider), the job is assigned to C1.
+  const hostedJob = {
+    instanceUid: J1,
+    name: 'Hosted nightly',
+    backupServerUid: S1,
+    organizationUid: C2,
+    mappedOrganizationUid: C1,
+    status: 'Failed',
+    lastEndTime: new Date(now - 3_600_000).toISOString(),
+    failureMessage: 'Error',
+  };
+  const routes = {
+    '/infrastructure/backupServers/jobs': page([hostedJob]),
+    '/infrastructure/backupAgents/jobs': page([]),
+    '/infrastructure/vb365Servers/organizations/jobs': page([]),
+    '/infrastructure/jobSessionHeatmap/': json({ data: { successJobsCount: 0, warningJobsCount: 0, failJobsCount: 1 } }),
+    '/organizations': ORGS,
+    '/infrastructure/backupServers': SERVERS,
+  };
+
+  it('is the mapped company in the job list, the failure list and the summary alike', async () => {
+    setFetchForTests(fakeVspc(routes).fn);
+    const list = JSON.parse(textOf(await call('vspc_list_jobs')));
+    const failed = JSON.parse(textOf(await call('vspc_list_failed_jobs')));
+    const summary = JSON.parse(textOf(await call('vspc_failed_jobs_summary')));
+    expect(list.jobs[0].company).toBe('Client One');
+    expect(failed.jobs[0].company).toBe('Client One');
+    expect(summary.rows[0].company).toBe('Client One');
+    expect(summary.byCompany).toEqual([{ company: 'Client One', failed: 1, warning: 0 }]);
+  });
+
+  it('falls back to the server owner when the mapped company is empty', async () => {
+    const unmapped = { ...hostedJob, mappedOrganizationUid: '' };
+    setFetchForTests(fakeVspc({ ...routes, '/infrastructure/backupServers/jobs': page([unmapped]) }).fn);
+    expect(JSON.parse(textOf(await call('vspc_list_jobs'))).jobs[0].company).toBe('Client Two');
+    expect(JSON.parse(textOf(await call('vspc_list_failed_jobs'))).jobs[0].company).toBe('Client Two');
   });
 });
 

@@ -21,15 +21,18 @@ export const RESULT_STATUSES = ['Failed', 'Warning'] as const;
 interface SourceDef {
   path: string;
   statusProperty: string;
+  /** The job's company fields, in order of precedence (see jobCompanyUid). */
   companyProperties: string[];
 }
 
 const SOURCES: Record<JobSource, SourceDef> = {
-  // Jobs on managed Veeam Backup & Replication servers (VM, copy, tape, file share, agent jobs managed by VBR...)
+  // Jobs on managed Veeam Backup & Replication servers (VM, copy, tape, file share, agent jobs managed by VBR...).
+  // mappedOrganizationUid is the company the job is assigned to; organizationUid owns the backup
+  // server (on a hosted server that is the provider), so the mapped company comes first.
   backup_server: {
     path: '/infrastructure/backupServers/jobs',
     statusProperty: 'status',
-    companyProperties: ['organizationUid', 'mappedOrganizationUid'],
+    companyProperties: ['mappedOrganizationUid', 'organizationUid'],
   },
   // Jobs of Veeam Agents managed by VSPC (backup policies on workstations and servers)
   agent: { path: '/infrastructure/backupAgents/jobs', statusProperty: 'status', companyProperties: ['organizationUid'] },
@@ -40,6 +43,25 @@ const SOURCES: Record<JobSource, SourceDef> = {
     companyProperties: ['vspcOrganizationUid'],
   },
 };
+
+/**
+ * The company a job belongs to: the first non-empty company field in the
+ * source's order of precedence (VBR jobs: mapped company, then the server's
+ * owner). Every tool that names a job's company uses this, so a job is never
+ * put under two different companies.
+ */
+export function jobCompanyUid(source: JobSource, job: Record<string, unknown>): string | undefined {
+  for (const p of SOURCES[source].companyProperties) {
+    const v = job[p];
+    if (typeof v === 'string' && v.trim() !== '') return v.trim().toLowerCase();
+  }
+  return undefined;
+}
+
+/** VSPC filter for a company's jobs: any of the source's company fields (so a job matches by either). */
+export function jobCompanyFilter(source: JobSource, uid: string): FilterExpression {
+  return companyFilter(SOURCES[source].companyProperties, uid);
+}
 
 export function statusFilter(property: string, statuses: readonly string[]): FilterExpression {
   if (statuses.length === 1) return { property, operation: 'equals', value: statuses[0] };
@@ -107,7 +129,7 @@ export async function findFailedJobs(api: Api, q: FailedJobsQuery): Promise<Fail
     sources.map(async (source) => {
       const def = SOURCES[source];
       const filter: FilterExpression[] = [statusFilter(def.statusProperty, q.statuses)];
-      if (q.companyUid) filter.push(companyFilter(def.companyProperties, q.companyUid));
+      if (q.companyUid) filter.push(jobCompanyFilter(source, q.companyUid));
       const path = source === 'backup_server' && q.backupServerUid ? `/infrastructure/backupServers/${q.backupServerUid}/jobs` : def.path;
       let got;
       try {
@@ -125,7 +147,7 @@ export async function findFailedJobs(api: Api, q: FailedJobsQuery): Promise<Fail
         const ended = timeOf(j.lastEndTime) ?? timeOf(j.lastRun);
         if (ended === undefined || ended < since) continue;
         const status = String((source === 'vb365' ? j.lastStatus : j.status) ?? 'Unknown');
-        const companyUid = (def.companyProperties.map((p) => j[p]).find((v) => typeof v === 'string' && v) as string | undefined) ?? undefined;
+        const companyUid = jobCompanyUid(source, j);
         jobs.push({
           source,
           jobUid: (j.instanceUid as string) ?? undefined,
