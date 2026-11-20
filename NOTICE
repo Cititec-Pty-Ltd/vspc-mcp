@@ -1,0 +1,6 @@
+vspc-mcp
+Copyright 2026 Cititec Pty Ltd
+
+This product includes software developed by WYRE Technology
+(https://github.com/WYRE-AI/unifi-mcp), licensed under the Apache License 2.0:
+the logger and the build and container setup.
