@@ -1,6 +1,6 @@
 import type { Api } from '../client.js';
 import type { FilterExpression } from '../types.js';
-import { Names, safely } from './lookups.js';
+import { Names, nameOrUid, safely } from './lookups.js';
 import { oneLine, timeOf } from './shared.js';
 
 /**
@@ -189,16 +189,17 @@ export async function findFailedJobs(api: Api, q: FailedJobsQuery): Promise<Fail
   // Names, best effort.
   const orgs = await safely(names.organizations());
   const servers = jobs.some((j) => j.source === 'backup_server') ? await safely(names.backupServers()) : undefined;
-  const agentUids = [...new Set(jobs.filter((j) => j.source === 'agent' && j.whereUid).map((j) => String(j.whereUid)))].slice(
+  const agentUids = [...new Set(jobs.filter((j) => j.source === 'agent' && j.whereUid).map((j) => String(j.whereUid).toLowerCase()))].slice(
     0,
     MAX_AGENT_LOOKUPS
   );
   const agentNames = new Map<string, string | undefined>();
   await Promise.all(agentUids.map(async (u) => agentNames.set(u, await names.agentName(u))));
   for (const j of jobs) {
-    if (j.companyUid) j.company = orgs?.get(j.companyUid.toLowerCase());
-    if (j.source === 'backup_server' && j.whereUid) j.where = servers?.get(j.whereUid.toLowerCase());
-    if (j.source === 'agent' && j.whereUid) j.where = agentNames.get(j.whereUid);
+    j.company = nameOrUid(orgs, j.companyUid);
+    if (j.source === 'backup_server') j.where = nameOrUid(servers, j.whereUid);
+    else if (j.source === 'agent') j.where = nameOrUid(agentNames, j.whereUid);
+    else j.where = j.where || nameOrUid(undefined, j.whereUid);
   }
 
   jobs.sort((a, b) => (timeOf(b.lastEndTime ?? b.lastRun) ?? 0) - (timeOf(a.lastEndTime ?? a.lastRun) ?? 0));

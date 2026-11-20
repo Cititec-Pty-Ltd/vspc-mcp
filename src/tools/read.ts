@@ -3,7 +3,7 @@ import type { FilterExpression } from '../types.js';
 import { VspcApiError } from '../types.js';
 import { JOB_SOURCES, RESULT_STATUSES, companyFilter, findFailedJobs, groupFailures, jobBelongsTo, jobCompanyFilter, jobCompanyUid, statusFilter } from './jobs.js';
 import type { JobSource } from './jobs.js';
-import { Names, resolveCompany, safely } from './lookups.js';
+import { Names, nameOrUid, resolveCompany, safely } from './lookups.js';
 import type { ParamSpec, ReadSpec } from './spec.js';
 import { hoursAgo, oneLine, pick, timeOf } from './shared.js';
 
@@ -95,7 +95,7 @@ export const READ_SPECS: ReadSpec[] = [
         ...paging(p),
         companies: p.items.map((c) => ({
           ...pick(c, ['instanceUid', 'name', 'status']),
-          ...(c.resellerUid ? { reseller: resellers?.get(String(c.resellerUid).toLowerCase()) ?? c.resellerUid } : {}),
+          ...(c.resellerUid ? { reseller: nameOrUid(resellers, c.resellerUid) } : {}),
         })),
       };
     },
@@ -141,7 +141,7 @@ export const READ_SPECS: ReadSpec[] = [
         ...paging(p),
         backupServers: p.items.map((s) => ({
           ...pick(s, ['instanceUid', 'name']),
-          company: orgs?.get(String(s.organizationUid ?? '').toLowerCase()) ?? s.organizationUid,
+          company: nameOrUid(orgs, s.organizationUid),
           ...pick(s, ['status', 'displayVersion', 'version', 'backupServerRoleType', 'inHighAvailabilityCluster']),
         })),
       };
@@ -196,8 +196,9 @@ export const READ_SPECS: ReadSpec[] = [
           const owner = jobCompanyUid('backup_server', j);
           return {
             ...pick(j, ['instanceUid', 'name']),
-            company: (owner && orgs?.get(owner)) ?? owner,
-            backupServer: servers?.get(String(j.backupServerUid ?? '').toLowerCase()) ?? j.backupServerUid,
+            company: nameOrUid(orgs, owner),
+            companyUid: owner,
+            backupServer: nameOrUid(servers, j.backupServerUid),
             ...pick(j, JOB_FIELDS),
             ...(oneLine(j.failureMessage, 400) ? { failureMessage: oneLine(j.failureMessage, 400) } : {}),
           };
@@ -230,15 +231,16 @@ export const READ_SPECS: ReadSpec[] = [
       });
       const names = new Names(api);
       const orgs = await safely(names.organizations());
-      const agentUids = [...new Set(p.items.map((j) => String(j.backupAgentUid ?? '')).filter(Boolean))].slice(0, 40);
+      const agentUids = [...new Set(p.items.map((j) => String(j.backupAgentUid ?? '').toLowerCase()).filter(Boolean))].slice(0, 40);
       const computers = new Map<string, string | undefined>();
       await Promise.all(agentUids.map(async (u) => computers.set(u, await names.agentName(u))));
       return {
         ...paging(p),
         agentJobs: p.items.map((j) => ({
           ...pick(j, ['instanceUid', 'name']),
-          computer: computers.get(String(j.backupAgentUid ?? '')) ?? j.backupAgentUid,
-          company: ((uid) => (uid && orgs?.get(uid)) ?? uid)(jobCompanyUid('agent', j)),
+          computer: nameOrUid(computers, j.backupAgentUid),
+          company: nameOrUid(orgs, jobCompanyUid('agent', j)),
+          companyUid: jobCompanyUid('agent', j),
           ...pick(j, ['systemType', 'backupPolicyName', 'backupPolicyAssignStatus', 'status', 'lastRun', 'lastEndTime', 'lastDuration', 'nextRun', 'backupMode', 'targetType', 'destination', 'isEnabled']),
           ...(oneLine(j.failureMessage ?? j.backupPolicyFailureMessage, 400)
             ? { failureMessage: oneLine(j.failureMessage ?? j.backupPolicyFailureMessage, 400) }
@@ -274,7 +276,7 @@ export const READ_SPECS: ReadSpec[] = [
         statuses: r.statuses,
         count: r.jobs.length,
         ...(r.jobs.length > (args.max_rows as number) ? { shown: args.max_rows, more: 'Narrow by company, sources or hours, or use vspc_failed_jobs_summary.' } : {}),
-        jobs: r.jobs.slice(0, args.max_rows as number).map(({ companyUid: _c, whereUid, ...j }) => ({ ...j, where: j.where ?? whereUid })),
+        jobs: r.jobs.slice(0, args.max_rows as number),
         scanned: r.scanned,
         note: 'Latest session per job only (VSPC keeps no session history). Incomplete sources are marked complete: false.',
       };
@@ -385,7 +387,7 @@ export const READ_SPECS: ReadSpec[] = [
             objectType: obj.type,
             objectName: obj.objectName ?? undefined,
             computer: obj.computerName || undefined,
-            company: orgs?.get(String(obj.organizationUid ?? '').toLowerCase()) ?? obj.organizationUid,
+            company: nameOrUid(orgs, obj.organizationUid),
             repeatCount: a.repeatCount,
           };
         });
@@ -439,8 +441,8 @@ export const READ_SPECS: ReadSpec[] = [
         ...paging(p),
         vms: p.items.map((v) => ({
           ...pick(v, ['instanceUid', 'name']),
-          company: orgs?.get(String(v.organizationUid ?? '').toLowerCase()) ?? v.organizationUid,
-          backupServer: servers?.get(String(v.backupServerUid ?? '').toLowerCase()) ?? v.backupServerUid,
+          company: nameOrUid(orgs, v.organizationUid),
+          backupServer: nameOrUid(servers, v.backupServerUid),
           ...pick(v, ['restorePoints', 'latestRestorePointDate', 'provisionedSourceSize', 'usedSourceSize', 'totalRestorePointSize', 'immutable', 'malwareState']),
         })),
       };
@@ -493,10 +495,10 @@ export const READ_SPECS: ReadSpec[] = [
       const nonZero = (w: Record<string, unknown>) => USAGE_FIELDS.some((f) => Number(w[f] ?? 0) !== 0);
       const totals = new Map<string, { workload: string; unitType?: unknown } & Record<UsageField, number>>();
       const organizations = p.items.map((o) => ({
-        organization: orgs?.get(String(o.organizationUid ?? '').toLowerCase()) ?? o.organizationUid,
+        organization: nameOrUid(orgs, o.organizationUid),
         organizationType: o.organizationType,
         servers: (Array.isArray(o.servers) ? (o.servers as Record<string, unknown>[]) : []).map((s) => ({
-          server: servers?.get(String(s.serverUid ?? '').toLowerCase()) ?? s.serverUid,
+          server: nameOrUid(servers, s.serverUid),
           serverType: s.serverType,
           workloads: (Array.isArray(s.workloads) ? (s.workloads as Record<string, unknown>[]) : []).filter(nonZero).map((w) => {
             const workload = String(w.description ?? w.id ?? 'workload');

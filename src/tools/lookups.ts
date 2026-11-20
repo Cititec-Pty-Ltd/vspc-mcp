@@ -87,3 +87,14 @@ export async function resolveCompany(api: Api, value: string): Promise<{ uid: st
     `"${wanted}" matches ${page.total} companies; give the full name or the UID: ${names.join('; ')}${page.total > 15 ? '; ...' : ''}`
   );
 }
+
+/**
+ * How every tool names a company, server or computer: the name when the lookup
+ * found one, otherwise the UID itself, so a failed or incomplete lookup never
+ * loses the reference. Undefined only when there is no UID at all.
+ */
+export function nameOrUid(names: ReadonlyMap<string, string | undefined> | undefined, uid: unknown): string | undefined {
+  if (typeof uid !== 'string' || uid.trim() === '') return undefined;
+  const id = uid.trim();
+  return names?.get(id.toLowerCase()) || id;
+}

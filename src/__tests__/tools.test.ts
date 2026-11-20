@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ALL_SPECS, ALL_TOOLS, READ_TOOL_NAMES, WRITE_TOOL_NAMES, dispatchToolCall } from '../tools/index.js';
 import { parseVspcUrl, runWithConfig, setFetchForTests, scrub, buildUrl, getConfig, canonicalJson, writeRequestId } from '../client.js';
 import { baseJobName, groupFailures } from '../tools/jobs.js';
+import { nameOrUid } from '../tools/lookups.js';
 import type { FailedJob } from '../tools/jobs.js';
 import { fakeVspc, filterOf, json, page, textOf } from './test-helpers.js';
 
@@ -619,6 +620,66 @@ describe('a job\'s company', () => {
     expect(JSON.parse(textOf(await call('vspc_list_jobs', { company: C2 }))).jobs.map((j: { name: string }) => j.name)).toEqual(['Hosted nightly']);
     expect(JSON.parse(textOf(await call('vspc_list_failed_jobs', { company: C2 }))).count).toBe(1);
     expect(JSON.parse(textOf(await call('vspc_list_jobs', { company: C1 }))).total).toBe(0);
+  });
+});
+
+describe('names fall back to UIDs', () => {
+  const now = Date.now();
+  const C3 = '33333333-3333-4333-8333-333333333333'; // not in the organisation list
+  const job = {
+    instanceUid: J1,
+    name: 'Nightly',
+    backupServerUid: S1,
+    organizationUid: C3,
+    status: 'Failed',
+    lastEndTime: new Date(now - 3_600_000).toISOString(),
+  };
+  const base = {
+    '/infrastructure/backupServers/jobs': page([job]),
+    '/infrastructure/backupAgents/jobs': page([{ instanceUid: 'aj', name: 'WS', backupAgentUid: A1, organizationUid: C3, status: 'Failed', lastEndTime: new Date(now - 3_600_000).toISOString() }]),
+    [`/infrastructure/backupAgents/${A1}`]: json({ data: { instanceUid: A1, name: 'PC-001' } }),
+    '/infrastructure/vb365Servers/organizations/jobs': page([]),
+    '/infrastructure/jobSessionHeatmap/': json({ data: { successJobsCount: 0, warningJobsCount: 0, failJobsCount: 2 } }),
+    '/alarms/active': page([{ instanceUid: AL1, alarmTemplateUid: 't1', object: { organizationUid: C3 }, lastActivation: { status: 'Error', time: new Date(now).toISOString() } }]),
+    '/alarms/templates': page([]),
+  };
+  const lookupFails = { '/organizations': json({ data: null, errors: [{ message: 'boom' }] }, 500), '/infrastructure/backupServers': json({ data: null }, 500) };
+  const missingEntry = { '/organizations': ORGS, '/infrastructure/backupServers': page([{ instanceUid: S1, name: 'VBR-01', organizationUid: C3 }]) };
+
+  for (const [label, lookups] of [['the lookup fails', lookupFails], ['the entry is missing', missingEntry]] as const) {
+    it(`keeps the UID when ${label}`, async () => {
+      setFetchForTests(fakeVspc({ ...base, ...lookups }).fn);
+      const failed = JSON.parse(textOf(await call('vspc_list_failed_jobs')));
+      const vbr = failed.jobs.find((j: { source: string }) => j.source === 'backup_server');
+      expect(vbr).toMatchObject({ company: C3, companyUid: C3 });
+      expect(vbr.where).toBe(label === 'the lookup fails' ? S1 : 'VBR-01');
+      const summary = JSON.parse(textOf(await call('vspc_failed_jobs_summary')));
+      expect(summary.rows.every((r: { company: string }) => r.company === C3)).toBe(true);
+      expect(summary.byCompany).toEqual([{ company: C3, failed: 2, warning: 0 }]);
+      const list = JSON.parse(textOf(await call('vspc_list_jobs')));
+      expect(list.jobs[0]).toMatchObject({ company: C3, companyUid: C3 });
+      const agents = JSON.parse(textOf(await call('vspc_list_agent_jobs')));
+      expect(agents.agentJobs[0]).toMatchObject({ company: C3, companyUid: C3, computer: 'PC-001' });
+      const alarms = JSON.parse(textOf(await call('vspc_list_alarms')));
+      expect(alarms.alarms[0].company).toBe(C3);
+      expect(alarms.alarms[0].alarm).toBe('t1');
+    });
+  }
+
+  it('servers keep their company UID too', async () => {
+    setFetchForTests(fakeVspc({ '/infrastructure/backupServers': page([{ instanceUid: S1, name: 'VBR-01', organizationUid: C3 }]), '/organizations': json({}, 500) }).fn);
+    const out = JSON.parse(textOf(await call('vspc_list_backup_servers')));
+    expect(out.backupServers[0].company).toBe(C3);
+  });
+
+  it('nameOrUid: name, else UID, else nothing', () => {
+    const m = new Map([[C1, 'Client One'], [C2, '']]);
+    expect(nameOrUid(m, C1.toUpperCase())).toBe('Client One');
+    expect(nameOrUid(m, C2)).toBe(C2); // empty name
+    expect(nameOrUid(m, C3)).toBe(C3); // missing
+    expect(nameOrUid(undefined, C3)).toBe(C3); // lookup failed
+    expect(nameOrUid(m, '')).toBeUndefined();
+    expect(nameOrUid(m, null)).toBeUndefined();
   });
 });
 
