@@ -16,6 +16,9 @@ describe('Retry-After parsing', () => {
   it('reads retryAfter from a VSPC JSON body', () => {
     expect(retryAfterFromBody('{"retryAfter":4}')).toBe(4000);
     expect(retryAfterFromBody('{"data":{"retryAfter":"2"}}')).toBe(2000);
+    // The shape VSPC documents for throttling
+    expect(retryAfterFromBody('{"errors":[{"type":"transport","code":429,"retryAfter":25}]}')).toBe(25000);
+    expect(retryAfterFromBody('{"errors":[{"type":"transport","code":429},{"retryAfter":3}]}')).toBe(3000);
     expect(retryAfterFromBody('{"errors":[]}')).toBeUndefined();
     expect(retryAfterFromBody('not json')).toBeUndefined();
   });

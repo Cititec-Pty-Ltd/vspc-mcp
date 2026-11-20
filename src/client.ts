@@ -13,6 +13,11 @@ const MAX_RESPONSE_CHARS = 25_000_000;
 const DEFAULT_RETRY_AFTER_SECONDS = 60;
 /** VSPC's largest page. */
 export const MAX_PAGE = 500;
+/**
+ * The REST API contract this client is written for, sent as X-Client-Version on every request
+ * (VSPC 9.1 = 3.6.1). A newer console answers in this contract's shape.
+ */
+export const VSPC_API_VERSION = '3.6.1';
 
 const KEY_HINT =
   ' Check VSPC_API_KEY: a Simple REST API key (Configuration > Access Management > REST API Keys, scope rest) whose user is enabled.';
@@ -147,6 +152,7 @@ export async function request<T = unknown>(
       headers: {
         Authorization: `Bearer ${config.apiKey}`,
         Accept: 'application/json',
+        'X-Client-Version': VSPC_API_VERSION,
         ...(requestId ? { 'X-Request-id': requestId } : {}),
       },
       signal: AbortSignal.timeout(timeoutMs),

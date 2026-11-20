@@ -105,6 +105,7 @@ describe('requests', () => {
     expect(JSON.parse(textOf(r))).toEqual({ serverVersion: '9.1.0.1', installationId: 'x' });
     const headers = vspc.calls[0].init.headers as Record<string, string>;
     expect(headers.Authorization).toBe(`Bearer ${KEY}`);
+    expect(headers['X-Client-Version']).toBe('3.6.1');
     expect(vspc.calls[0].url.origin).toBe('https://vspc.test:1280');
   });
 
@@ -144,6 +145,30 @@ describe('fleet 429 policy', () => {
     const r = await p;
     expect(r.isError).toBeUndefined();
     expect(vspc.calls).toHaveLength(2);
+  });
+
+  it('retries after VSPC\'s documented errors[].retryAfter body (no header)', async () => {
+    vi.useFakeTimers();
+    let n = 0;
+    const vspc = fakeVspc({
+      '/about': () =>
+        n++ === 0
+          ? json({ data: null, errors: [{ type: 'transport', code: 429, retryAfter: 3 }] }, 429)
+          : json({ data: { serverVersion: '9.1' } }),
+    });
+    setFetchForTests(vspc.fn);
+    const p = call('vspc_about');
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect((await p).isError).toBeUndefined();
+    expect(vspc.calls).toHaveLength(2);
+  });
+
+  it('reports the errors[].retryAfter wait when it is too long to retry', async () => {
+    const vspc = fakeVspc({ '/about': json({ data: null, errors: [{ type: 'transport', code: 429, retryAfter: 25 }] }, 429) });
+    setFetchForTests(vspc.fn);
+    const r = await call('vspc_about');
+    expect(r.structuredContent).toEqual({ error: 'rate_limited', retryAfterSeconds: 25 });
+    expect(vspc.calls).toHaveLength(1);
   });
 
   it('reads retryAfter from the JSON body', async () => {
@@ -426,6 +451,7 @@ describe('writes', () => {
     expect(out).toEqual({ requested: 'start', jobUid: J1, accepted: true });
     expect(vspc.calls).toHaveLength(1);
     expect((vspc.calls[0].init.headers as Record<string, string>)['X-Request-id']).toMatch(/^[0-9a-f-]{36}$/);
+    expect((vspc.calls[0].init.headers as Record<string, string>)['X-Client-Version']).toBe('3.6.1');
   });
 
   it('acknowledges an alarm with its comment', async () => {

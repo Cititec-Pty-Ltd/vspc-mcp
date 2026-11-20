@@ -33,7 +33,13 @@ export function parseRetryAfter(value: string | null | undefined, now: number = 
 export function retryAfterFromBody(body: string): number | undefined {
   try {
     const parsed = JSON.parse(body) as Record<string, unknown>;
-    const candidates = [parsed?.retryAfter, (parsed?.data as Record<string, unknown> | undefined)?.retryAfter];
+    // VSPC's documented throttling body: {"errors":[{"type":"transport","code":429,"retryAfter":25}]}
+    const errors = Array.isArray(parsed?.errors) ? (parsed.errors as Record<string, unknown>[]) : [];
+    const candidates = [
+      ...errors.map((e) => e?.retryAfter),
+      parsed?.retryAfter,
+      (parsed?.data as Record<string, unknown> | undefined)?.retryAfter,
+    ];
     for (const c of candidates) {
       if (typeof c === 'number' && Number.isFinite(c) && c >= 0) return Math.ceil(c * 1000);
       if (typeof c === 'string') {
